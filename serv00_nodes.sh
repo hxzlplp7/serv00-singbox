@@ -91,49 +91,38 @@ init_directories() {
     devil binexec on >/dev/null 2>&1
 }
 
-# 获取可用IP
-get_available_ip() {
-    IP_LIST=($(devil vhost list | awk '/^[0-9]+/ {print $1}'))
-    API_URL="https://status.eooce.com/api"
-    IP=""
+# 获取所有可用IP
+get_all_ips() {
+    # 获取三个可用的IP
+    IP1=$(dig @8.8.8.8 +time=5 +short "$HOSTNAME" 2>/dev/null | head -n1)
+    IP2=$(dig @8.8.8.8 +time=5 +short "cache$nb.${hona}.com" 2>/dev/null | head -n1)
+    IP3=$(dig @8.8.8.8 +time=5 +short "web$nb.${hona}.com" 2>/dev/null | head -n1)
     
-    # 优先尝试第三个IP
-    THIRD_IP=${IP_LIST[2]}
-    if [ -n "$THIRD_IP" ]; then
-        RESPONSE=$(curl -s --max-time 3 "${API_URL}/${THIRD_IP}" 2>/dev/null)
-        if [[ $(echo "$RESPONSE" | jq -r '.status' 2>/dev/null) == "Available" ]]; then
-            IP=$THIRD_IP
-        fi
+    # 去重并存储
+    ALL_IPS=()
+    [ -n "$IP1" ] && ALL_IPS+=("$IP1")
+    [ -n "$IP2" ] && [[ ! " ${ALL_IPS[*]} " =~ " $IP2 " ]] && ALL_IPS+=("$IP2")
+    [ -n "$IP3" ] && [[ ! " ${ALL_IPS[*]} " =~ " $IP3 " ]] && ALL_IPS+=("$IP3")
+    
+    # 如果dig失败，使用devil vhost list
+    if [ ${#ALL_IPS[@]} -eq 0 ]; then
+        ALL_IPS=($(devil vhost list | awk '/^[0-9]+/ {print $1}'))
     fi
     
-    # 第三个不可用，尝试第一个
-    if [ -z "$IP" ]; then
-        FIRST_IP=${IP_LIST[0]}
-        if [ -n "$FIRST_IP" ]; then
-            RESPONSE=$(curl -s --max-time 3 "${API_URL}/${FIRST_IP}" 2>/dev/null)
-            if [[ $(echo "$RESPONSE" | jq -r '.status' 2>/dev/null) == "Available" ]]; then
-                IP=$FIRST_IP
-            fi
-        fi
-    fi
+    export ALL_IPS
+    export IP_COUNT=${#ALL_IPS[@]}
     
-    # 降级到第二个IP
-    if [ -z "$IP" ]; then
-        IP=${IP_LIST[1]:-${IP_LIST[0]}}
-    fi
-    
-    echo "$IP"
+    # 保存到文件
+    printf '%s\n' "${ALL_IPS[@]}" > "$WORKDIR/all_ips.txt"
 }
 
 # 显示IP列表
 display_ip_list() {
-    green "可用IP列表:"
-    ym=("$HOSTNAME" "cache$nb.${hona}.com" "web$nb.${hona}.com")
-    for host in "${ym[@]}"; do
-        ip=$(dig @8.8.8.8 +time=5 +short "$host" 2>/dev/null | head -n1)
-        if [ -n "$ip" ]; then
-            purple "  $host -> $ip"
-        fi
+    green "可用IP列表 (共 ${IP_COUNT} 个):"
+    local idx=1
+    for ip in "${ALL_IPS[@]}"; do
+        purple "  [$idx] $ip"
+        ((idx++))
     done
 }
 
@@ -372,15 +361,11 @@ read_user_config() {
     green "==== 配置节点参数 ===="
     echo
     
-    # 选择IP
+    # 获取并显示所有IP
+    get_all_ips
     display_ip_list
     echo
-    reading "请选择IP (回车自动选择最佳IP): " selected_ip
-    if [ -z "$selected_ip" ]; then
-        selected_ip=$(get_available_ip)
-    fi
-    export SELECTED_IP=$selected_ip
-    green "选择的IP: $SELECTED_IP"
+    green "将为所有 ${IP_COUNT} 个IP生成节点"
     
     # UUID
     echo
@@ -413,6 +398,7 @@ read_user_config() {
     echo "$REALITY_DOMAIN" > "$WORKDIR/reym.txt"
     green "Reality域名: $REALITY_DOMAIN"
 }
+
 
 # 配置Argo隧道
 configure_argo() {
@@ -519,12 +505,14 @@ EOF
     # 构建inbounds数组
     inbounds=()
     
-    # Hysteria2
+    # Hysteria2 - 为每个IP创建监听
     if [[ "$ENABLE_HYSTERIA2" == "true" ]]; then
-        inbounds+=("    {
-      \"tag\": \"hysteria2-in\",
+        local idx=1
+        for ip in "${ALL_IPS[@]}"; do
+            inbounds+=("    {
+      \"tag\": \"hysteria2-in-$idx\",
       \"type\": \"hysteria2\",
-      \"listen\": \"$SELECTED_IP\",
+      \"listen\": \"$ip\",
       \"listen_port\": $HY2_PORT,
       \"users\": [{\"password\": \"$UUID\"}],
       \"masquerade\": \"https://www.bing.com\",
@@ -536,6 +524,8 @@ EOF
         \"key_path\": \"private.key\"
       }
     }")
+            ((idx++))
+        done
     fi
     
     # VLESS Reality
@@ -601,12 +591,14 @@ EOF
     }")
     fi
     
-    # TUIC v5
+    # TUIC v5 - 为每个IP创建监听
     if [[ "$ENABLE_TUIC" == "true" ]]; then
-        inbounds+=("    {
-      \"tag\": \"tuic-in\",
+        local idx=1
+        for ip in "${ALL_IPS[@]}"; do
+            inbounds+=("    {
+      \"tag\": \"tuic-in-$idx\",
       \"type\": \"tuic\",
-      \"listen\": \"$SELECTED_IP\",
+      \"listen\": \"$ip\",
       \"listen_port\": $TUIC_PORT,
       \"users\": [{
         \"uuid\": \"$UUID\",
@@ -620,6 +612,8 @@ EOF
         \"key_path\": \"private.key\"
       }
     }")
+            ((idx++))
+        done
     fi
     
     # Shadowsocks 2022
@@ -638,6 +632,7 @@ EOF
     IFS=','
     echo "${inbounds[*]}" >> config.json
     unset IFS
+
     
     # 关闭inbounds并添加outbounds
     cat >> config.json <<EOF
@@ -913,9 +908,15 @@ get_argo_domain() {
 generate_links() {
     cd "$WORKDIR"
     
+    # 读取IP列表
+    if [ -f "$WORKDIR/all_ips.txt" ]; then
+        mapfile -t ALL_IPS < "$WORKDIR/all_ips.txt"
+    fi
+    IP_COUNT=${#ALL_IPS[@]}
+    
     ARGO_DOMAIN_FINAL=$(get_argo_domain)
     
-    green "生成节点链接中..."
+    green "生成节点链接中... (共 ${IP_COUNT} 个IP)"
     echo
     
     # 清空链接文件
@@ -930,7 +931,13 @@ generate_links() {
     echo "Serv00/Hostuno 多协议节点配置" >> list.txt
     echo "========================================" >> list.txt
     echo "" >> list.txt
-    echo "IP: $SELECTED_IP" >> list.txt
+    echo "可用IP列表 (共 ${IP_COUNT} 个):" >> list.txt
+    local idx=1
+    for ip in "${ALL_IPS[@]}"; do
+        echo "  [$idx] $ip" >> list.txt
+        ((idx++))
+    done
+    echo "" >> list.txt
     echo "UUID: $UUID" >> list.txt
     echo "" >> list.txt
     echo "端口分配:" >> list.txt
@@ -940,97 +947,140 @@ generate_links() {
     echo "  TUIC Port: $TUIC_PORT" >> list.txt
     echo "" >> list.txt
     
-    # VLESS Reality
+    local node_count=0
+    
+    # 为每个IP生成 VLESS Reality
     if [[ "$ENABLE_VLESS_REALITY" == "true" ]]; then
-        vless_link="vless://$UUID@$SELECTED_IP:$VLESS_PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$REALITY_DOMAIN&fp=chrome&pbk=$REALITY_PUBLIC_KEY&type=tcp&headerType=none#$NAME-vless-reality"
-        echo "$vless_link" >> links.txt
-        echo "VLESS-Reality:" >> list.txt
-        echo "$vless_link" >> list.txt
-        echo "" >> list.txt
-        purple "VLESS-Reality 节点已生成"
+        echo "=== VLESS-Reality ===" >> list.txt
+        local idx=1
+        for ip in "${ALL_IPS[@]}"; do
+            vless_link="vless://$UUID@$ip:$VLESS_PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$REALITY_DOMAIN&fp=chrome&pbk=$REALITY_PUBLIC_KEY&type=tcp&headerType=none#$NAME-vless-$idx"
+            echo "$vless_link" >> links.txt
+            echo "[$idx] $ip" >> list.txt
+            echo "$vless_link" >> list.txt
+            echo "" >> list.txt
+            ((idx++))
+            ((node_count++))
+        done
+        purple "VLESS-Reality 节点已生成 (${IP_COUNT} 个)"
     fi
     
-    # VMess WS (直连)
+    # 为每个IP生成 VMess WS (直连)
     if [[ "$ENABLE_VMESS_WS" == "true" ]]; then
-        vmess_direct=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-vmess-ws\", \"add\": \"$SELECTED_IP\", \"port\": \"$VMESS_PORT\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\", \"sni\": \"\"}" | base64 -w0)
-        echo "vmess://$vmess_direct" >> links.txt
-        echo "VMess-WS (直连):" >> list.txt
-        echo "vmess://$vmess_direct" >> list.txt
-        echo "" >> list.txt
-        purple "VMess-WS 直连节点已生成"
+        echo "=== VMess-WS (直连) ===" >> list.txt
+        local idx=1
+        for ip in "${ALL_IPS[@]}"; do
+            vmess_direct=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-vmess-$idx\", \"add\": \"$ip\", \"port\": \"$VMESS_PORT\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\", \"sni\": \"\"}" | base64 -w0)
+            echo "vmess://$vmess_direct" >> links.txt
+            echo "[$idx] $ip" >> list.txt
+            echo "vmess://$vmess_direct" >> list.txt
+            echo "" >> list.txt
+            ((idx++))
+            ((node_count++))
+        done
+        purple "VMess-WS 直连节点已生成 (${IP_COUNT} 个)"
     fi
     
-    # VMess WS Argo (TLS)
+    # VMess WS Argo (TLS) - Argo只需要一个
     if [[ "$ENABLE_ARGO" == "true" ]] && [[ -n "$ARGO_DOMAIN_FINAL" ]]; then
-        vmess_argo_tls=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-vmess-argo-tls\", \"add\": \"$CFIP\", \"port\": \"$CFPORT\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\"}" | base64 -w0)
+        echo "=== VMess-WS-Argo ===" >> list.txt
+        vmess_argo_tls=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-tls\", \"add\": \"$CFIP\", \"port\": \"$CFPORT\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\"}" | base64 -w0)
         echo "vmess://$vmess_argo_tls" >> links.txt
         
-        vmess_argo=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-vmess-argo\", \"add\": \"$CFIP\", \"port\": \"8880\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
+        vmess_argo=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo\", \"add\": \"$CFIP\", \"port\": \"8880\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
         echo "vmess://$vmess_argo" >> links.txt
         
-        echo "VMess-WS-Argo (TLS):" >> list.txt
+        echo "Argo TLS:" >> list.txt
         echo "vmess://$vmess_argo_tls" >> list.txt
         echo "" >> list.txt
-        echo "VMess-WS-Argo (无TLS):" >> list.txt
+        echo "Argo NoTLS:" >> list.txt
         echo "vmess://$vmess_argo" >> list.txt
         echo "" >> list.txt
-        purple "VMess-WS-Argo 节点已生成"
+        ((node_count+=2))
         
         # 多个CDN端点
         for port in 443 2053 2083 2087 2096 8443; do
-            vmess_cdn=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-vmess-cdn-$port\", \"add\": \"104.16.0.0\", \"port\": \"$port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\"}" | base64 -w0)
+            vmess_cdn=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-cdn-$port\", \"add\": \"104.16.0.0\", \"port\": \"$port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\"}" | base64 -w0)
             echo "vmess://$vmess_cdn" >> links.txt
+            ((node_count++))
         done
         
         for port in 80 8080 8880 2052 2082 2086 2095; do
-            vmess_cdn=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-vmess-cdn-$port\", \"add\": \"104.17.0.0\", \"port\": \"$port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
+            vmess_cdn=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-cdn-$port\", \"add\": \"104.17.0.0\", \"port\": \"$port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
             echo "vmess://$vmess_cdn" >> links.txt
+            ((node_count++))
         done
+        purple "VMess-WS-Argo 节点已生成 (含CDN节点)"
     fi
     
-    # Trojan WS
+    # 为每个IP生成 Trojan WS
     if [[ "$ENABLE_TROJAN_WS" == "true" ]]; then
-        trojan_link="trojan://$UUID@$SELECTED_IP:$VMESS_PORT?security=tls&sni=${USERNAME}.${DOMAIN}&type=ws&path=/$UUID-tr#$NAME-trojan-ws"
-        echo "$trojan_link" >> links.txt
-        echo "Trojan-WS:" >> list.txt
-        echo "$trojan_link" >> list.txt
-        echo "" >> list.txt
-        purple "Trojan-WS 节点已生成"
+        echo "=== Trojan-WS ===" >> list.txt
+        local idx=1
+        for ip in "${ALL_IPS[@]}"; do
+            trojan_link="trojan://$UUID@$ip:$VMESS_PORT?security=tls&sni=${USERNAME}.${DOMAIN}&type=ws&path=/$UUID-tr#$NAME-trojan-$idx"
+            echo "$trojan_link" >> links.txt
+            echo "[$idx] $ip" >> list.txt
+            echo "$trojan_link" >> list.txt
+            echo "" >> list.txt
+            ((idx++))
+            ((node_count++))
+        done
+        purple "Trojan-WS 节点已生成 (${IP_COUNT} 个)"
     fi
     
-    # Hysteria2
+    # 为每个IP生成 Hysteria2
     if [[ "$ENABLE_HYSTERIA2" == "true" ]]; then
-        hy2_link="hysteria2://$UUID@$SELECTED_IP:$HY2_PORT?security=tls&sni=www.bing.com&alpn=h3&insecure=1#$NAME-hysteria2"
-        echo "$hy2_link" >> links.txt
-        echo "Hysteria2:" >> list.txt
-        echo "$hy2_link" >> list.txt
-        echo "" >> list.txt
-        purple "Hysteria2 节点已生成"
+        echo "=== Hysteria2 ===" >> list.txt
+        local idx=1
+        for ip in "${ALL_IPS[@]}"; do
+            hy2_link="hysteria2://$UUID@$ip:$HY2_PORT?security=tls&sni=www.bing.com&alpn=h3&insecure=1#$NAME-hy2-$idx"
+            echo "$hy2_link" >> links.txt
+            echo "[$idx] $ip" >> list.txt
+            echo "$hy2_link" >> list.txt
+            echo "" >> list.txt
+            ((idx++))
+            ((node_count++))
+        done
+        purple "Hysteria2 节点已生成 (${IP_COUNT} 个)"
     fi
     
-    # TUIC v5
+    # 为每个IP生成 TUIC v5
     if [[ "$ENABLE_TUIC" == "true" ]]; then
-        tuic_link="tuic://$UUID:$UUID@$SELECTED_IP:$TUIC_PORT?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#$NAME-tuic"
-        echo "$tuic_link" >> links.txt
-        echo "TUIC v5:" >> list.txt
-        echo "$tuic_link" >> list.txt
-        echo "" >> list.txt
-        purple "TUIC v5 节点已生成"
+        echo "=== TUIC v5 ===" >> list.txt
+        local idx=1
+        for ip in "${ALL_IPS[@]}"; do
+            tuic_link="tuic://$UUID:$UUID@$ip:$TUIC_PORT?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#$NAME-tuic-$idx"
+            echo "$tuic_link" >> links.txt
+            echo "[$idx] $ip" >> list.txt
+            echo "$tuic_link" >> list.txt
+            echo "" >> list.txt
+            ((idx++))
+            ((node_count++))
+        done
+        purple "TUIC v5 节点已生成 (${IP_COUNT} 个)"
     fi
     
-    # Shadowsocks
+    # Shadowsocks (只需要一个，监听::)
     if [[ "$ENABLE_SHADOWSOCKS" == "true" ]]; then
+        echo "=== Shadowsocks-2022 ===" >> list.txt
         SS_PASSWORD=$(cat ss_password.txt 2>/dev/null)
-        ss_link="ss://$(echo -n "2022-blake3-aes-128-gcm:$SS_PASSWORD" | base64 -w0)@$SELECTED_IP:$((VMESS_PORT+1))#$NAME-shadowsocks"
-        echo "$ss_link" >> links.txt
-        echo "Shadowsocks-2022:" >> list.txt
-        echo "$ss_link" >> list.txt
-        echo "" >> list.txt
-        purple "Shadowsocks-2022 节点已生成"
+        local idx=1
+        for ip in "${ALL_IPS[@]}"; do
+            ss_link="ss://$(echo -n "2022-blake3-aes-128-gcm:$SS_PASSWORD" | base64 -w0)@$ip:$((VMESS_PORT+1))#$NAME-ss-$idx"
+            echo "$ss_link" >> links.txt
+            echo "[$idx] $ip" >> list.txt
+            echo "$ss_link" >> list.txt
+            echo "" >> list.txt
+            ((idx++))
+            ((node_count++))
+        done
+        purple "Shadowsocks-2022 节点已生成 (${IP_COUNT} 个)"
     fi
     
     echo "" >> list.txt
     echo "========================================" >> list.txt
+    echo "总计节点数: $node_count" >> list.txt
     echo "Argo域名: $ARGO_DOMAIN_FINAL" >> list.txt
     echo "========================================" >> list.txt
     
@@ -1046,11 +1096,13 @@ generate_links() {
     
     echo
     green "=========================================="
+    green "节点总数: $node_count 个"
     green "节点链接文件: $WORKDIR/links.txt"
     green "详细信息文件: $WORKDIR/list.txt" 
     green "订阅链接: $SUB_LINK"
     green "=========================================="
 }
+
 
 # 显示链接
 show_links() {
