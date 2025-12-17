@@ -365,7 +365,30 @@ read_user_config() {
     get_all_ips
     display_ip_list
     echo
-    green "将为所有 ${IP_COUNT} 个IP生成节点"
+    
+    # 让用户选择IP模式
+    yellow "IP模式选择:"
+    yellow "  1. 使用所有可用IP (推荐，生成更多节点)"
+    yellow "  2. 只使用最佳IP (单IP模式)"
+    reading "请选择 1-2 (回车默认1): " ip_mode
+    
+    if [[ "$ip_mode" == "2" ]]; then
+        # 单IP模式 - 让用户选择或自动选择最佳IP
+        USE_ALL_IPS=false
+        reading "请输入要使用的IP (回车自动选择第一个): " selected_ip
+        if [ -z "$selected_ip" ]; then
+            selected_ip=${ALL_IPS[0]}
+        fi
+        # 只保留选中的IP
+        ALL_IPS=("$selected_ip")
+        IP_COUNT=1
+        printf '%s\n' "${ALL_IPS[@]}" > "$WORKDIR/all_ips.txt"
+        green "选择的IP: $selected_ip (单IP模式)"
+    else
+        # 所有IP模式
+        USE_ALL_IPS=true
+        green "将为所有 ${IP_COUNT} 个IP生成节点"
+    fi
     
     # UUID
     echo
@@ -398,6 +421,7 @@ read_user_config() {
     echo "$REALITY_DOMAIN" > "$WORKDIR/reym.txt"
     green "Reality域名: $REALITY_DOMAIN"
 }
+
 
 
 # 配置Argo隧道
