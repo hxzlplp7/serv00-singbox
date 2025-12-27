@@ -297,52 +297,38 @@ check_port() {
                 local port_type=$(devil port list | grep "^$conflict_port" | awk '{print $2}')
                 
                 # 添加一个新端口
-                local new_port_added=false
+                local new_port=""
                 local retry=0
-                while [[ $retry -lt 20 && "$new_port_added" == "false" ]]; do
-                    local new_port=$(shuf -i 10000-65535 -n 1)
+                while [[ $retry -lt 20 && -z "$new_port" ]]; do
+                    local candidate=$(shuf -i 10000-65535 -n 1)
                     
                     # 检查新端口是否被占用
-                    if check_port_in_use $new_port >/dev/null 2>&1; then
+                    if check_port_in_use $candidate >/dev/null 2>&1; then
                         ((retry++))
                         continue
                     fi
                     
-                    result=$(devil port add $port_type $new_port 2>&1)
+                    result=$(devil port add $port_type $candidate 2>&1)
                     if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]]; then
+                        new_port=$candidate
                         green "已添加新端口: $new_port ($port_type) 替换被占用的 $conflict_port"
-                        new_port_added=true
                     fi
                     ((retry++))
                 done
-            done
-            
-            # 重新获取端口分配
-            sleep 1
-            port_list=$(devil port list)
-            
-            # 重新分配未被占用的端口
-            # TCP端口（跳过被占用的）
-            local available_tcp=()
-            for p in $(echo "$port_list" | awk '/tcp/ {print $1}'); do
-                if ! check_port_in_use $p >/dev/null 2>&1; then
-                    available_tcp+=("$p")
+                
+                # 直接替换对应的端口变量
+                if [ -n "$new_port" ]; then
+                    if [[ "$conflict_port" == "$VMESS_PORT" ]]; then
+                        export VMESS_PORT=$new_port
+                    elif [[ "$conflict_port" == "$VLESS_PORT" ]]; then
+                        export VLESS_PORT=$new_port
+                    elif [[ "$conflict_port" == "$HY2_PORT" ]]; then
+                        export HY2_PORT=$new_port
+                    elif [[ "$conflict_port" == "$TUIC_PORT" ]]; then
+                        export TUIC_PORT=$new_port
+                    fi
                 fi
             done
-            
-            # UDP端口（跳过被占用的）
-            local available_udp=()
-            for p in $(echo "$port_list" | awk '/udp/ {print $1}'); do
-                if ! check_port_in_use $p >/dev/null 2>&1; then
-                    available_udp+=("$p")
-                fi
-            done
-            
-            # 重新分配
-            export VMESS_PORT=${available_tcp[0]:-$TCP_PORT1}
-            export VLESS_PORT=${available_tcp[1]:-$TCP_PORT2}
-            export HY2_PORT=${available_udp[0]:-$UDP_PORT1}
-            export TUIC_PORT=${available_udp[1]:-$UDP_PORT2}
             
             echo
             green "端口已重新分配:"
