@@ -170,74 +170,70 @@ check_port() {
     if [[ "$PLATFORM" == "hostuno" ]]; then
         yellow "Hostuno平台: 直接添加新端口..."
         
-        # 添加带描述的端口
-        # VMess端口 (TCP)
-        local vmess_port=""
-        local retry=0
-        while [[ $retry -lt 20 && -z "$vmess_port" ]]; do
-            local candidate=$(shuf -i 10000-65535 -n 1)
-            if check_port_in_use $candidate >/dev/null 2>&1; then
+        # 添加端口的通用函数
+        add_port_with_desc() {
+            local port_type=$1
+            local desc=$2
+            local added_port=""
+            local retry=0
+            
+            while [[ $retry -lt 30 && -z "$added_port" ]]; do
+                local candidate=$(shuf -i 10000-65535 -n 1)
+                
+                # 检查端口是否被占用
+                if check_port_in_use $candidate >/dev/null 2>&1; then
+                    ((retry++))
+                    continue
+                fi
+                
+                # 先尝试带描述添加
+                result=$(devil port add $port_type $candidate "$desc" 2>&1)
+                if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]] || [[ $result == *"success"* ]]; then
+                    added_port=$candidate
+                else
+                    # 如果带描述失败，尝试不带描述
+                    result=$(devil port add $port_type $candidate 2>&1)
+                    if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]] || [[ $result == *"success"* ]]; then
+                        added_port=$candidate
+                    fi
+                fi
                 ((retry++))
-                continue
-            fi
-            result=$(devil port add tcp $candidate "singbox-vmess" 2>&1)
-            if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]]; then
-                vmess_port=$candidate
-                green "已添加端口: $vmess_port (TCP) - singbox-vmess"
-            fi
-            ((retry++))
-        done
+            done
+            
+            echo "$added_port"
+        }
+        
+        # VMess端口 (TCP)
+        local vmess_port=$(add_port_with_desc "tcp" "singbox-vmess")
+        if [ -n "$vmess_port" ]; then
+            green "已添加端口: $vmess_port (TCP) - singbox-vmess"
+        else
+            red "VMess端口添加失败"
+        fi
         
         # VLESS端口 (TCP)
-        local vless_port=""
-        retry=0
-        while [[ $retry -lt 20 && -z "$vless_port" ]]; do
-            local candidate=$(shuf -i 10000-65535 -n 1)
-            if check_port_in_use $candidate >/dev/null 2>&1; then
-                ((retry++))
-                continue
-            fi
-            result=$(devil port add tcp $candidate "singbox-vless" 2>&1)
-            if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]]; then
-                vless_port=$candidate
-                green "已添加端口: $vless_port (TCP) - singbox-vless"
-            fi
-            ((retry++))
-        done
+        local vless_port=$(add_port_with_desc "tcp" "singbox-vless")
+        if [ -n "$vless_port" ]; then
+            green "已添加端口: $vless_port (TCP) - singbox-vless"
+        else
+            red "VLESS端口添加失败"
+        fi
         
         # Hysteria2端口 (UDP)
-        local hy2_port=""
-        retry=0
-        while [[ $retry -lt 20 && -z "$hy2_port" ]]; do
-            local candidate=$(shuf -i 10000-65535 -n 1)
-            if check_port_in_use $candidate >/dev/null 2>&1; then
-                ((retry++))
-                continue
-            fi
-            result=$(devil port add udp $candidate "singbox-hy2" 2>&1)
-            if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]]; then
-                hy2_port=$candidate
-                green "已添加端口: $hy2_port (UDP) - singbox-hy2"
-            fi
-            ((retry++))
-        done
+        local hy2_port=$(add_port_with_desc "udp" "singbox-hy2")
+        if [ -n "$hy2_port" ]; then
+            green "已添加端口: $hy2_port (UDP) - singbox-hy2"
+        else
+            red "Hysteria2端口添加失败 (可能UDP端口数量已达上限)"
+        fi
         
         # TUIC端口 (UDP)
-        local tuic_port=""
-        retry=0
-        while [[ $retry -lt 20 && -z "$tuic_port" ]]; do
-            local candidate=$(shuf -i 10000-65535 -n 1)
-            if check_port_in_use $candidate >/dev/null 2>&1; then
-                ((retry++))
-                continue
-            fi
-            result=$(devil port add udp $candidate "singbox-tuic" 2>&1)
-            if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]]; then
-                tuic_port=$candidate
-                green "已添加端口: $tuic_port (UDP) - singbox-tuic"
-            fi
-            ((retry++))
-        done
+        local tuic_port=$(add_port_with_desc "udp" "singbox-tuic")
+        if [ -n "$tuic_port" ]; then
+            green "已添加端口: $tuic_port (UDP) - singbox-tuic"
+        else
+            red "TUIC端口添加失败 (可能UDP端口数量已达上限)"
+        fi
         
         # 分配端口
         export VMESS_PORT=$vmess_port
@@ -247,11 +243,26 @@ check_port() {
         
         echo
         purple "端口分配:"
-        purple "  VMess-WS/Trojan: $VMESS_PORT (TCP)"
-        purple "  VLESS-Reality:   $VLESS_PORT (TCP)"
-        purple "  Hysteria2:       $HY2_PORT (UDP)"
-        purple "  TUIC v5:         $TUIC_PORT (UDP)"
-        green "✓ 所有端口已添加"
+        purple "  VMess-WS/Trojan: ${VMESS_PORT:-未分配} (TCP)"
+        purple "  VLESS-Reality:   ${VLESS_PORT:-未分配} (TCP)"
+        purple "  Hysteria2:       ${HY2_PORT:-未分配} (UDP)"
+        purple "  TUIC v5:         ${TUIC_PORT:-未分配} (UDP)"
+        
+        # 检查是否有端口添加失败
+        if [ -z "$vmess_port" ] || [ -z "$vless_port" ]; then
+            red "⚠ TCP端口添加失败，无法继续安装"
+            return 1
+        fi
+        
+        if [ -z "$hy2_port" ] && [ -z "$tuic_port" ]; then
+            yellow "⚠ UDP端口全部添加失败，Hysteria2和TUIC将不可用"
+            yellow "提示: Hostuno可能限制了UDP端口数量，请检查面板"
+        elif [ -z "$hy2_port" ] || [ -z "$tuic_port" ]; then
+            yellow "⚠ 部分UDP端口添加失败，部分协议将不可用"
+        else
+            green "✓ 所有端口已添加"
+        fi
+        
         return 0
     fi
     
