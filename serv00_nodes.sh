@@ -274,10 +274,12 @@ check_port() {
     # 检测端口占用情况
     echo
     local has_conflict=false
+    local conflict_ports=()
     
     for port in $VMESS_PORT $VLESS_PORT $HY2_PORT $TUIC_PORT; do
         if [ -n "$port" ] && check_port_in_use $port >/dev/null 2>&1; then
             has_conflict=true
+            conflict_ports+=("$port")
             show_port_usage $port
         fi
     done
@@ -285,10 +287,124 @@ check_port() {
     if $has_conflict; then
         echo
         red "⚠ 检测到端口冲突！"
-        yellow "请先终止占用进程，或选择菜单 6 重置端口"
-        reading "是否继续安装? (y/N): " continue_install
-        if [[ ! "$continue_install" =~ ^[Yy]$ ]]; then
-            return 1
+        
+        if [[ "$PLATFORM" == "hostuno" ]]; then
+            # Hostuno: 添加新端口替换被占用的
+            yellow "Hostuno平台: 自动添加新端口替换被占用端口..."
+            
+            for conflict_port in "${conflict_ports[@]}"; do
+                # 确定是TCP还是UDP
+                local port_type=$(devil port list | grep "^$conflict_port" | awk '{print $2}')
+                
+                # 添加一个新端口
+                local new_port_added=false
+                local retry=0
+                while [[ $retry -lt 20 && "$new_port_added" == "false" ]]; do
+                    local new_port=$(shuf -i 10000-65535 -n 1)
+                    
+                    # 检查新端口是否被占用
+                    if check_port_in_use $new_port >/dev/null 2>&1; then
+                        ((retry++))
+                        continue
+                    fi
+                    
+                    result=$(devil port add $port_type $new_port 2>&1)
+                    if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]]; then
+                        green "已添加新端口: $new_port ($port_type) 替换被占用的 $conflict_port"
+                        new_port_added=true
+                    fi
+                    ((retry++))
+                done
+            done
+            
+            # 重新获取端口分配
+            sleep 1
+            port_list=$(devil port list)
+            
+            # 重新分配未被占用的端口
+            # TCP端口（跳过被占用的）
+            local available_tcp=()
+            for p in $(echo "$port_list" | awk '/tcp/ {print $1}'); do
+                if ! check_port_in_use $p >/dev/null 2>&1; then
+                    available_tcp+=("$p")
+                fi
+            done
+            
+            # UDP端口（跳过被占用的）
+            local available_udp=()
+            for p in $(echo "$port_list" | awk '/udp/ {print $1}'); do
+                if ! check_port_in_use $p >/dev/null 2>&1; then
+                    available_udp+=("$p")
+                fi
+            done
+            
+            # 重新分配
+            export VMESS_PORT=${available_tcp[0]:-$TCP_PORT1}
+            export VLESS_PORT=${available_tcp[1]:-$TCP_PORT2}
+            export HY2_PORT=${available_udp[0]:-$UDP_PORT1}
+            export TUIC_PORT=${available_udp[1]:-$UDP_PORT2}
+            
+            echo
+            green "端口已重新分配:"
+            purple "  VMess-WS/Trojan: $VMESS_PORT (TCP)"
+            purple "  VLESS-Reality:   $VLESS_PORT (TCP)"
+            purple "  Hysteria2:       $HY2_PORT (UDP)"
+            purple "  TUIC v5:         $TUIC_PORT (UDP)"
+            
+        else
+            # Serv00: 删除被占用端口，添加新端口
+            yellow "Serv00平台: 删除被占用端口并重新分配..."
+            
+            for conflict_port in "${conflict_ports[@]}"; do
+                local port_type=$(devil port list | grep "^$conflict_port" | awk '{print $2}')
+                
+                # 删除被占用的端口
+                devil port del $port_type $conflict_port >/dev/null 2>&1
+                yellow "已删除被占用端口: $conflict_port ($port_type)"
+                
+                # 添加一个新端口
+                local new_port_added=false
+                local retry=0
+                while [[ $retry -lt 20 && "$new_port_added" == "false" ]]; do
+                    local new_port=$(shuf -i 10000-65535 -n 1)
+                    
+                    # 检查新端口是否被占用
+                    if check_port_in_use $new_port >/dev/null 2>&1; then
+                        ((retry++))
+                        continue
+                    fi
+                    
+                    result=$(devil port add $port_type $new_port 2>&1)
+                    if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]]; then
+                        green "已添加新端口: $new_port ($port_type)"
+                        new_port_added=true
+                    fi
+                    ((retry++))
+                done
+            done
+            
+            # 重新获取端口分配
+            sleep 1
+            port_list=$(devil port list)
+            tcp_ports=$(echo "$port_list" | awk '/tcp/ {print $1}')
+            TCP_PORT1=$(echo "$tcp_ports" | sed -n '1p')
+            TCP_PORT2=$(echo "$tcp_ports" | sed -n '2p')
+            
+            udp_ports=$(echo "$port_list" | awk '/udp/ {print $1}')
+            UDP_PORT1=$(echo "$udp_ports" | sed -n '1p')
+            UDP_PORT2=$(echo "$udp_ports" | sed -n '2p')
+            
+            export VMESS_PORT=$TCP_PORT1
+            export VLESS_PORT=$TCP_PORT2
+            export HY2_PORT=$UDP_PORT1
+            export TUIC_PORT=$UDP_PORT2
+            
+            echo
+            green "端口已重新分配:"
+            purple "  VMess-WS/Trojan: $VMESS_PORT (TCP)"
+            purple "  VLESS-Reality:   $VLESS_PORT (TCP)"
+            purple "  Hysteria2:       $HY2_PORT (UDP)"
+            purple "  TUIC v5:         $TUIC_PORT (UDP)"
         fi
     else
         green "✓ 所有端口可用"
