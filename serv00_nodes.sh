@@ -753,8 +753,21 @@ start_singbox() {
     # 杀掉现有进程
     pkill -f "run -c config.json" >/dev/null 2>&1
     
-    # 启动sing-box
-    nohup ./"$SB_BINARY" run -c config.json >/dev/null 2>&1 &
+    # 清空旧日志
+    > "$WORKDIR/singbox.log"
+    
+    # 先验证配置
+    yellow "验证配置文件..."
+    config_check=$(./"$SB_BINARY" check -c config.json 2>&1)
+    if [ $? -ne 0 ]; then
+        red "配置文件验证失败:"
+        echo "$config_check" | head -20
+        return 1
+    fi
+    green "配置文件验证通过"
+    
+    # 启动sing-box，保存日志
+    nohup ./"$SB_BINARY" run -c config.json >> "$WORKDIR/singbox.log" 2>&1 &
     sleep 3
     
     if pgrep -x "$SB_BINARY" > /dev/null; then
@@ -762,7 +775,23 @@ start_singbox() {
         return 0
     else
         red "sing-box 主进程启动失败"
+        show_singbox_log
         return 1
+    fi
+}
+
+# 显示sing-box日志
+show_singbox_log() {
+    local log_file="$WORKDIR/singbox.log"
+    if [ -f "$log_file" ] && [ -s "$log_file" ]; then
+        echo
+        yellow "========== sing-box 错误日志 =========="
+        tail -30 "$log_file"
+        yellow "======================================="
+        echo
+        yellow "完整日志: $log_file"
+    else
+        yellow "暂无日志信息"
     fi
 }
 
@@ -778,6 +807,9 @@ start_argo() {
     
     # 杀掉现有进程
     pkill -f "tunnel" >/dev/null 2>&1
+    
+    # 清空旧日志
+    > "$WORKDIR/argo.log"
     
     local args=""
     if [[ -n "$ARGO_AUTH" ]]; then
@@ -802,12 +834,12 @@ EOF
             args="tunnel --edge-ip-version auto --config tunnel.yml run"
         fi
     else
-        # 临时隧道
+        # 临时隧道 - 日志写入boot.log
         args="tunnel --url http://localhost:$VMESS_PORT --no-autoupdate --logfile boot.log --loglevel info"
     fi
     
-    # 启动cloudflared
-    nohup ./"$CF_BINARY" $args >/dev/null 2>&1 &
+    # 启动cloudflared，保存日志
+    nohup ./"$CF_BINARY" $args >> "$WORKDIR/argo.log" 2>&1 &
     sleep 5
     
     if pgrep -x "$CF_BINARY" > /dev/null; then
@@ -815,7 +847,23 @@ EOF
         return 0
     else
         red "Argo隧道启动失败"
+        show_argo_log
         return 1
+    fi
+}
+
+# 显示Argo日志
+show_argo_log() {
+    local log_file="$WORKDIR/argo.log"
+    if [ -f "$log_file" ] && [ -s "$log_file" ]; then
+        echo
+        yellow "========== Argo 错误日志 =========="
+        tail -20 "$log_file"
+        yellow "===================================="
+        echo
+        yellow "完整日志: $log_file"
+    else
+        yellow "暂无Argo日志信息"
     fi
 }
 
@@ -1300,6 +1348,155 @@ reset_argo() {
     generate_links
 }
 
+# ==================== 日志管理 ====================
+
+# 查看日志菜单
+view_logs_menu() {
+    clear
+    echo
+    green "============================================================"
+    green "  运行日志查看"
+    green "============================================================"
+    echo
+    
+    # 显示日志文件状态
+    purple "日志文件状态:"
+    
+    # sing-box日志
+    if [ -f "$WORKDIR/singbox.log" ]; then
+        local sb_size=$(stat -f%z "$WORKDIR/singbox.log" 2>/dev/null || stat -c%s "$WORKDIR/singbox.log" 2>/dev/null)
+        if [ "$sb_size" -gt 0 ] 2>/dev/null; then
+            green "  [1] sing-box.log - ${sb_size} bytes"
+        else
+            yellow "  [1] sing-box.log - 空"
+        fi
+    else
+        yellow "  [1] sing-box.log - 不存在"
+    fi
+    
+    # Argo日志
+    if [ -f "$WORKDIR/argo.log" ]; then
+        local argo_size=$(stat -f%z "$WORKDIR/argo.log" 2>/dev/null || stat -c%s "$WORKDIR/argo.log" 2>/dev/null)
+        if [ "$argo_size" -gt 0 ] 2>/dev/null; then
+            green "  [2] argo.log - ${argo_size} bytes"
+        else
+            yellow "  [2] argo.log - 空"
+        fi
+    else
+        yellow "  [2] argo.log - 不存在"
+    fi
+    
+    # boot.log (Argo临时隧道日志)
+    if [ -f "$WORKDIR/boot.log" ]; then
+        local boot_size=$(stat -f%z "$WORKDIR/boot.log" 2>/dev/null || stat -c%s "$WORKDIR/boot.log" 2>/dev/null)
+        if [ "$boot_size" -gt 0 ] 2>/dev/null; then
+            green "  [3] boot.log (Argo隧道) - ${boot_size} bytes"
+        else
+            yellow "  [3] boot.log (Argo隧道) - 空"
+        fi
+    else
+        yellow "  [3] boot.log (Argo隧道) - 不存在"
+    fi
+    
+    echo
+    echo "------------------------------------------------------------"
+    green "  1. 查看 sing-box 日志"
+    green "  2. 查看 Argo 日志"
+    green "  3. 查看 boot.log (Argo临时隧道)"
+    echo "------------------------------------------------------------"
+    blue "  4. 查看所有日志"
+    blue "  5. 清空所有日志"
+    echo "------------------------------------------------------------"
+    yellow "  0. 返回主菜单"
+    echo "============================================================"
+    
+    reading "请选择 [0-5]: " log_choice
+    echo
+    
+    case "$log_choice" in
+        1)
+            echo
+            green "========== sing-box 日志 (最近50行) =========="
+            if [ -f "$WORKDIR/singbox.log" ] && [ -s "$WORKDIR/singbox.log" ]; then
+                tail -50 "$WORKDIR/singbox.log"
+            else
+                yellow "sing-box日志为空或不存在"
+            fi
+            green "=============================================="
+            echo
+            yellow "完整日志路径: $WORKDIR/singbox.log"
+            ;;
+        2)
+            echo
+            green "========== Argo 日志 (最近50行) =========="
+            if [ -f "$WORKDIR/argo.log" ] && [ -s "$WORKDIR/argo.log" ]; then
+                tail -50 "$WORKDIR/argo.log"
+            else
+                yellow "Argo日志为空或不存在"
+            fi
+            green "========================================="
+            echo
+            yellow "完整日志路径: $WORKDIR/argo.log"
+            ;;
+        3)
+            echo
+            green "========== boot.log (Argo隧道日志) 最近50行 =========="
+            if [ -f "$WORKDIR/boot.log" ] && [ -s "$WORKDIR/boot.log" ]; then
+                tail -50 "$WORKDIR/boot.log"
+            else
+                yellow "boot.log为空或不存在"
+            fi
+            green "===================================================="
+            echo
+            yellow "完整日志路径: $WORKDIR/boot.log"
+            ;;
+        4)
+            echo
+            green "========== 所有日志概览 =========="
+            echo
+            
+            if [ -f "$WORKDIR/singbox.log" ] && [ -s "$WORKDIR/singbox.log" ]; then
+                purple ">>> sing-box 日志 (最近10行):"
+                tail -10 "$WORKDIR/singbox.log"
+                echo
+            fi
+            
+            if [ -f "$WORKDIR/argo.log" ] && [ -s "$WORKDIR/argo.log" ]; then
+                purple ">>> Argo 日志 (最近10行):"
+                tail -10 "$WORKDIR/argo.log"
+                echo
+            fi
+            
+            if [ -f "$WORKDIR/boot.log" ] && [ -s "$WORKDIR/boot.log" ]; then
+                purple ">>> boot.log (最近10行):"
+                tail -10 "$WORKDIR/boot.log"
+                echo
+            fi
+            
+            green "================================="
+            ;;
+        5)
+            reading "确定清空所有日志? (y/N): " confirm_clear
+            if [[ "$confirm_clear" =~ ^[Yy]$ ]]; then
+                > "$WORKDIR/singbox.log" 2>/dev/null
+                > "$WORKDIR/argo.log" 2>/dev/null
+                > "$WORKDIR/boot.log" 2>/dev/null
+                green "所有日志已清空"
+            fi
+            ;;
+        0)
+            return
+            ;;
+        *)
+            red "无效选项"
+            ;;
+    esac
+    
+    echo
+    reading "按回车继续..." _
+    view_logs_menu
+}
+
 # ==================== 菜单 ====================
 
 menu() {
@@ -1344,6 +1541,8 @@ menu() {
     echo "------------------------------------------------------------"
     yellow "  6. 重置端口"
     echo "------------------------------------------------------------"
+    blue "  7. 查看运行日志"
+    echo "------------------------------------------------------------"
     red "  9. 系统初始化清理"
     echo "------------------------------------------------------------"
     red "  0. 退出"
@@ -1359,6 +1558,7 @@ menu() {
         4) reset_argo ;;
         5) show_links ;;
         6) reset_all_ports ;;
+        7) view_logs_menu ;;
         9) 
             reading "确定清理所有内容? (y/N): " confirm
             if [[ "$confirm" =~ ^[Yy]$ ]]; then
