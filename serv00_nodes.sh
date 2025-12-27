@@ -126,6 +126,44 @@ display_ip_list() {
     done
 }
 
+# 检测端口是否被占用
+check_port_in_use() {
+    local port=$1
+    local protocol=${2:-tcp}
+    
+    # 使用 sockstat 检测端口占用 (FreeBSD/Serv00)
+    local result=$(sockstat -l 2>/dev/null | grep ":$port " | head -1)
+    
+    if [ -n "$result" ]; then
+        echo "$result"
+        return 0  # 被占用
+    fi
+    return 1  # 未被占用
+}
+
+# 显示端口占用详情
+show_port_usage() {
+    local port=$1
+    local usage=$(check_port_in_use $port)
+    
+    if [ -n "$usage" ]; then
+        local proc_name=$(echo "$usage" | awk '{print $1}')
+        local proc_user=$(echo "$usage" | awk '{print $2}')
+        local proc_pid=$(echo "$usage" | awk '{print $3}')
+        
+        red "端口 $port 被占用:"
+        yellow "  进程: $proc_name"
+        yellow "  用户: $proc_user"
+        yellow "  PID:  $proc_pid"
+        echo
+        yellow "解决方案:"
+        yellow "  1. 终止进程: kill $proc_pid"
+        yellow "  2. 或重置端口: 菜单选项 6"
+        return 0
+    fi
+    return 1
+}
+
 # 检查和配置端口
 check_port() {
     port_list=$(devil port list)
@@ -162,31 +200,49 @@ check_port() {
             yellow "Hostuno平台：保留现有端口，仅添加缺失的端口"
         fi
         
-        # 添加缺失的TCP端口
+        # 添加缺失的TCP端口 (检测占用)
         if [[ $tcp_ports -lt $required_tcp ]]; then
             tcp_ports_to_add=$((required_tcp - tcp_ports))
             tcp_ports_added=0
-            while [[ $tcp_ports_added -lt $tcp_ports_to_add ]]; do
+            local retry_count=0
+            while [[ $tcp_ports_added -lt $tcp_ports_to_add && $retry_count -lt 20 ]]; do
                 tcp_port=$(shuf -i 10000-65535 -n 1)
+                
+                # 先检查端口是否被占用
+                if check_port_in_use $tcp_port >/dev/null 2>&1; then
+                    ((retry_count++))
+                    continue
+                fi
+                
                 result=$(devil port add tcp $tcp_port 2>&1)
                 if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]]; then
                     green "已添加TCP端口: $tcp_port"
                     tcp_ports_added=$((tcp_ports_added + 1))
                 fi
+                ((retry_count++))
             done
         fi
         
-        # 添加缺失的UDP端口
+        # 添加缺失的UDP端口 (检测占用)
         if [[ $udp_ports -lt $required_udp ]]; then
             udp_ports_to_add=$((required_udp - udp_ports))
             udp_ports_added=0
-            while [[ $udp_ports_added -lt $udp_ports_to_add ]]; do
+            local retry_count=0
+            while [[ $udp_ports_added -lt $udp_ports_to_add && $retry_count -lt 20 ]]; do
                 udp_port=$(shuf -i 10000-65535 -n 1)
+                
+                # 先检查端口是否被占用
+                if check_port_in_use $udp_port >/dev/null 2>&1; then
+                    ((retry_count++))
+                    continue
+                fi
+                
                 result=$(devil port add udp $udp_port 2>&1)
                 if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]]; then
                     green "已添加UDP端口: $udp_port"
                     udp_ports_added=$((udp_ports_added + 1))
                 fi
+                ((retry_count++))
             done
         fi
         
@@ -214,6 +270,29 @@ check_port() {
     purple "  VLESS-Reality:   $VLESS_PORT (TCP)"
     purple "  Hysteria2:       $HY2_PORT (UDP)"
     purple "  TUIC v5:         $TUIC_PORT (UDP)"
+    
+    # 检测端口占用情况
+    echo
+    local has_conflict=false
+    
+    for port in $VMESS_PORT $VLESS_PORT $HY2_PORT $TUIC_PORT; do
+        if [ -n "$port" ] && check_port_in_use $port >/dev/null 2>&1; then
+            has_conflict=true
+            show_port_usage $port
+        fi
+    done
+    
+    if $has_conflict; then
+        echo
+        red "⚠ 检测到端口冲突！"
+        yellow "请先终止占用进程，或选择菜单 6 重置端口"
+        reading "是否继续安装? (y/N): " continue_install
+        if [[ ! "$continue_install" =~ ^[Yy]$ ]]; then
+            return 1
+        fi
+    else
+        green "✓ 所有端口可用"
+    fi
 }
 
 # 重置所有端口
