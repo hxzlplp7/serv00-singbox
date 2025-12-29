@@ -62,6 +62,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/
 |------|------|
 | 多协议支持 | 一键安装多达 7 种代理协议 |
 | Argo 隧道 | 支持临时隧道和固定隧道切换 |
+| **WARP 出站** | 支持 Cloudflare WARP 代理出站，解锁流媒体 |
 | 自动端口管理 | 自动配置 TCP/UDP 端口 |
 | Reality 支持 | 自动生成 Reality 密钥对 |
 | 订阅链接 | 自动生成 Base64 订阅链接 |
@@ -124,6 +125,8 @@ UUID=你的UUID ARGO_DOMAIN=your.domain.com ARGO_AUTH=你的Token bash <(curl -L
 | 4 | 重置 Argo 隧道 |
 | 5 | 查看节点信息 |
 | 6 | 重置端口 |
+| 7 | 查看运行日志 |
+| 8 | **配置 WARP 出站** |
 | 9 | 系统初始化清理 |
 | 0 | 退出 |
 
@@ -211,6 +214,17 @@ ss://method:password@ip:port#name
 1. 确保安装了保活服务
 2. 检查保活页面是否正常运行
 3. 设置 GitHub Actions 或 Workers 保活
+
+### Q: 什么是 WARP 出站？
+
+WARP 是 Cloudflare 提供的免费 VPN 服务。启用 WARP 出站后，节点的出口流量会通过 Cloudflare 网络，可以：
+- 解锁 Netflix、YouTube 等流媒体
+- 隐藏服务器真实 IP
+- 访问需要非服务器 IP 的服务（如 OpenAI）
+
+脚本支持两种 WARP 模式：
+1. **全部流量** - 所有出站流量都走 WARP
+2. **分流模式** - 仅 Google/YouTube/Netflix/OpenAI 走 WARP，其他直连
 
 ---
 
