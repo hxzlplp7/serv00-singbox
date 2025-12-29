@@ -615,25 +615,20 @@ get_warp_endpoint() {
     fi
 }
 
-# WARP Endpoint IP 优选
-# 使用 warp-endpoint-optimizer-main 项目进行优选
+# WARP Endpoint IP 优选 (纯Shell实现，兼容FreeBSD)
+# 原理: 向WARP服务器发送UDP包，测量响应时间和丢包率
 optimize_warp_endpoint() {
     local ipv6_mode="$1"  # 传入 6 则使用 IPv6 优选
     
     echo
-    green "==== WARP Endpoint IP 优选 ===="
+    green "==== WARP Endpoint IP 优选 (Shell版) ===="
     echo
     
-    # 检测服务器CPU架构
-    local arch=""
-    case "$(uname -m)" in
-        x86_64 | amd64 ) arch='amd64' ;;
-        armv8 | arm64 | aarch64 ) arch='arm64' ;;
-        * ) 
-            red "不支持的CPU架构: $(uname -m)"
-            return 1
-            ;;
-    esac
+    # 检查依赖
+    if ! command -v nc >/dev/null 2>&1; then
+        red "错误: 需要 nc (netcat) 命令"
+        return 1
+    fi
     
     # 检查是否需要关闭 WARP/sing-box 服务
     local sb_binary=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
@@ -651,113 +646,147 @@ optimize_warp_endpoint() {
     fi
     
     cd "$WORKDIR"
-    local result_file="result.csv"
-    local warp_tool="warp_optimizer"
+    local result_file="warp_result.txt"
     
-    # 删除之前的优选结果文件
+    # 清理之前的结果
     rm -f "$result_file"
     
-    # 下载 WARP 优选工具
-    yellow "正在下载 WARP Endpoint 优选工具..."
+    # WARP 端口列表 (官方端口)
+    local ports=(500 1701 2408 4500)
     
-    # 根据系统选择下载源
-    local os_type=$(uname -s | tr '[:upper:]' '[:lower:]')
-    local download_url=""
+    # WARP 握手数据包 (从PHP项目获取的hex数据)
+    # 这是WARP客户端发送的第一个UDP握手包
+    local warp_packet="048792cd9d8631f11f226c0df5225e23979601980529b028988f00a99bdb073737000000000000000000000000baba1a1346e1b2fe7cd524fa23163746"
     
-    # FreeBSD 不能直接运行 darwin/linux 二进制，需要使用Go源码编译或使用兼容层
-    # 这里尝试下载 darwin 版本，如果不行则提示用户
-    if [[ "$os_type" == "freebsd" ]]; then
-        yellow "检测到 FreeBSD 系统，尝试使用兼容工具..."
-        # 尝试使用 linux 版本 (部分 FreeBSD 有 Linux 兼容层)
-        download_url="https://gitlab.com/Misaka-blog/warp-script/-/raw/main/files/warp-yxip/warp-linux-${arch}"
-    elif [[ "$os_type" == "darwin" ]]; then
-        download_url="https://gitlab.com/Misaka-blog/warp-script/-/raw/main/files/warp-yxip/warp-darwin-${arch}"
-    else
-        download_url="https://gitlab.com/Misaka-blog/warp-script/-/raw/main/files/warp-yxip/warp-linux-${arch}"
-    fi
+    # 生成测试IP列表
+    yellow "正在生成测试IP列表..."
     
-    yellow "下载地址: $download_url"
+    local test_ips=()
+    local cidr_base=""
     
-    # 尝试下载
-    local download_success=false
-    if curl -sL "$download_url" -o "$warp_tool" 2>&1; then
-        if [ -s "$warp_tool" ]; then
-            download_success=true
-        fi
-    fi
-    
-    if [ "$download_success" = false ]; then
-        if wget -qO "$warp_tool" "$download_url" 2>&1; then
-            if [ -s "$warp_tool" ]; then
-                download_success=true
-            fi
-        fi
-    fi
-    
-    # 检查下载结果
-    if [ "$download_success" = false ] || [ ! -s "$warp_tool" ]; then
-        red "优选工具下载失败"
-        yellow "可能原因: 网络问题或下载地址不可用"
-        rm -f "$warp_tool"
-        # 恢复服务
-        if $warp_running && [ -n "$sb_binary" ] && [ -f "$sb_binary" ]; then
-            nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
-            green "已恢复 sing-box 服务"
-        fi
-        return 1
-    fi
-    
-    # 显示文件大小
-    local file_size=$(ls -la "$warp_tool" | awk '{print $5}')
-    green "下载完成，文件大小: $file_size bytes"
-    
-    chmod +x "$warp_tool"
-    
-    # 检查是否可执行
-    if ! file "$warp_tool" 2>/dev/null | grep -qi "executable\|ELF\|Mach-O"; then
-        yellow "警告: 文件可能不是有效的可执行文件"
-        file "$warp_tool" 2>/dev/null || echo "无法检测文件类型"
-    fi
-    
-    # 设置线程限制 (如果可用)
-    ulimit -n 102400 2>/dev/null || true
-    
-    # 运行优选
-    yellow "开始优选 Endpoint IP (这可能需要几分钟)..."
-    echo
-    
-    local execute_error=""
     if [[ "$ipv6_mode" == "6" ]]; then
         yellow "模式: IPv6 优选"
-        execute_error=$(./"$warp_tool" -ipv6 2>&1) || execute_error=$(./"$warp_tool" 2>&1)
+        # IPv6 CIDR: 2606:4700:d0::/48, 2606:4700:d1::/48
+        # 简化处理: 使用已知的几个IPv6地址
+        test_ips=(
+            "2606:4700:d0::a29f:c001"
+            "2606:4700:d0::a29f:c002"
+            "2606:4700:d0::a29f:c003"
+            "2606:4700:d1::a29f:c001"
+            "2606:4700:d1::a29f:c002"
+        )
     else
         yellow "模式: IPv4 优选"
-        execute_error=$(./"$warp_tool" 2>&1)
+        # 从 162.159.192.0/24 和 162.159.193.0/24 生成随机IP
+        local cidrs=("162.159.192" "162.159.193" "162.159.195" "188.114.96" "188.114.97")
+        
+        for cidr in "${cidrs[@]}"; do
+            # 每个网段生成10个随机IP
+            for i in $(seq 1 10); do
+                local last_octet=$((RANDOM % 254 + 1))
+                test_ips+=("${cidr}.${last_octet}")
+            done
+        done
     fi
     
-    # 检查结果
-    if [ ! -f "$result_file" ]; then
-        red "优选失败，未生成结果文件"
-        echo
-        yellow "=== 错误详情 ==="
-        if [ -n "$execute_error" ]; then
-            echo "$execute_error" | head -20
-        else
-            yellow "无错误输出"
+    local total_ips=${#test_ips[@]}
+    green "共生成 $total_ips 个测试IP"
+    echo
+    
+    yellow "开始测试 Endpoint 延迟 (每个IP测试3次)..."
+    yellow "这可能需要几分钟，请耐心等待..."
+    echo
+    
+    # 进度显示
+    local tested=0
+    local success=0
+    
+    # 创建结果文件 (CSV格式: IP:Port, 丢包率, 平均延迟ms)
+    echo "endpoint,loss,delay" > "$result_file"
+    
+    for ip in "${test_ips[@]}"; do
+        # 随机选择端口
+        local port=${ports[$((RANDOM % ${#ports[@]}))]}
+        
+        local total_time=0
+        local recv_count=0
+        local send_count=3  # 每个IP发送3个包
+        
+        for i in $(seq 1 $send_count); do
+            # 使用 nc 发送UDP包并测量时间
+            # FreeBSD/Linux 兼容的方式
+            local start_time=$(date +%s%N 2>/dev/null || echo "0")
+            
+            # 如果不支持纳秒，使用秒
+            if [ "$start_time" = "0" ]; then
+                start_time=$(date +%s)
+                
+                # 发送数据包并等待响应 (超时0.5秒)
+                echo -n "$warp_packet" | xxd -r -p 2>/dev/null | \
+                    timeout 0.5 nc -u -w 1 "$ip" "$port" >/dev/null 2>&1 && recv_count=$((recv_count + 1))
+                
+                local end_time=$(date +%s)
+                local elapsed=$((end_time - start_time))
+                total_time=$((total_time + elapsed * 1000))  # 转换为毫秒
+            else
+                # 发送数据包并等待响应
+                # 尝试多种方式
+                local resp=""
+                
+                if command -v xxd >/dev/null 2>&1; then
+                    # 使用 xxd 转换 hex 到二进制
+                    resp=$(echo -n "$warp_packet" | xxd -r -p 2>/dev/null | \
+                        timeout 0.5 nc -u -w 1 "$ip" "$port" 2>/dev/null | head -c 10)
+                elif command -v printf >/dev/null 2>&1; then
+                    # 备用方法
+                    resp=$(printf '%s' "$warp_packet" | \
+                        timeout 0.5 nc -u -w 1 "$ip" "$port" 2>/dev/null | head -c 10)
+                fi
+                
+                local end_time=$(date +%s%N 2>/dev/null || date +%s)
+                
+                if [ -n "$resp" ]; then
+                    recv_count=$((recv_count + 1))
+                fi
+                
+                # 计算延迟 (纳秒转毫秒)
+                if [ ${#start_time} -gt 10 ]; then
+                    local elapsed=$(( (end_time - start_time) / 1000000 ))
+                else
+                    local elapsed=$((end_time - start_time))
+                    elapsed=$((elapsed * 1000))
+                fi
+                total_time=$((total_time + elapsed))
+            fi
+        done
+        
+        # 计算丢包率和平均延迟
+        local loss=100
+        local delay=9999
+        
+        if [ $recv_count -gt 0 ]; then
+            loss=$(( (send_count - recv_count) * 100 / send_count ))
+            delay=$((total_time / recv_count))
+            success=$((success + 1))
         fi
-        echo
-        yellow "=== 系统信息 ==="
-        yellow "系统: $(uname -s) $(uname -m)"
-        yellow "架构: $arch"
-        yellow "工作目录: $(pwd)"
-        ls -la "$warp_tool" 2>/dev/null || yellow "优选工具文件不存在"
-        echo
-        yellow "可能原因:"
-        yellow "  1. FreeBSD 系统不兼容 Linux/Darwin 二进制文件"
-        yellow "  2. 需要安装 Linux 兼容层 (linux_enable=YES)"
-        yellow "  3. 网络问题导致无法连接 WARP 服务器"
-        echo
-        rm -f "$warp_tool"
+        
+        # 保存结果
+        echo "${ip}:${port},${loss},${delay}" >> "$result_file"
+        
+        tested=$((tested + 1))
+        # 简化进度显示
+        if [ $((tested % 10)) -eq 0 ]; then
+            printf "\r已测试: %d/%d, 成功: %d" "$tested" "$total_ips" "$success"
+        fi
+    done
+    
+    echo
+    echo
+    
+    # 检查是否有结果
+    local result_count=$(wc -l < "$result_file" 2>/dev/null)
+    if [ "$result_count" -le 1 ]; then
+        red "优选失败，无有效结果"
         # 恢复服务
         if $warp_running && [ -n "$sb_binary" ] && [ -f "$sb_binary" ]; then
             nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
@@ -766,19 +795,30 @@ optimize_warp_endpoint() {
         return 1
     fi
     
-    # 显示优选结果
+    # 按丢包率和延迟排序，显示前10个结果
     echo
-    green "优选结果 (前10个):" 
-    echo "----------------------------------------"
-    awk -F, 'NR>1 && $3!="timeout ms" {print} ' "$result_file" | sort -t, -nk2 -nk3 | uniq | head -10 | awk -F, '{print "Endpoint: "$1"  丢包率: "$2"  延迟: "$3}'
-    echo "----------------------------------------"
+    green "优选结果 (按丢包率和延迟排序，前10个):"
+    echo "=========================================="
+    printf "%-25s %-10s %-10s\n" "Endpoint" "丢包率%" "延迟ms"
+    echo "------------------------------------------"
     
-    # 获取最优 IP
-    local best_endpoint=$(awk -F, 'NR==2{print $1}' "$result_file")
+    # 跳过表头，排序，显示前10个
+    tail -n +2 "$result_file" | \
+        awk -F, '$2 < 100 {print}' | \
+        sort -t, -k2,2n -k3,3n | \
+        head -10 | \
+        while IFS=, read -r endpoint loss delay; do
+            printf "%-25s %-10s %-10s\n" "$endpoint" "$loss" "$delay"
+        done
     
-    if [ -z "$best_endpoint" ]; then
-        red "无法获取最优 Endpoint"
-        rm -f "$warp_tool"
+    echo "=========================================="
+    
+    # 获取最优 Endpoint
+    local best_line=$(tail -n +2 "$result_file" | awk -F, '$2 < 100' | sort -t, -k2,2n -k3,3n | head -1)
+    
+    if [ -z "$best_line" ]; then
+        red "无法找到可用的 Endpoint (全部超时)"
+        yellow "可能原因: 网络不通或防火墙阻止UDP"
         # 恢复服务
         if $warp_running && [ -n "$sb_binary" ] && [ -f "$sb_binary" ]; then
             nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
@@ -787,26 +827,20 @@ optimize_warp_endpoint() {
         return 1
     fi
     
-    # 只取IP部分（去掉端口）
-    local best_ip=$(echo "$best_endpoint" | cut -d':' -f1)
-    local best_port=$(echo "$best_endpoint" | cut -d':' -f2)
-    
-    # 如果没有端口，使用默认端口 2408
-    if [ -z "$best_port" ] || [ "$best_ip" == "$best_endpoint" ]; then
-        best_port="2408"
-        best_ip="$best_endpoint"
-    fi
+    local best_endpoint=$(echo "$best_line" | cut -d, -f1)
+    local best_ip=$(echo "$best_endpoint" | cut -d: -f1)
+    local best_port=$(echo "$best_endpoint" | cut -d: -f2)
+    local best_loss=$(echo "$best_line" | cut -d, -f2)
+    local best_delay=$(echo "$best_line" | cut -d, -f3)
     
     echo
-    green "最优 Endpoint: $best_ip:$best_port"
+    green "★ 最优 Endpoint: $best_ip:$best_port"
+    green "  丢包率: ${best_loss}%, 延迟: ${best_delay}ms"
     
     # 保存优选结果
     echo "$best_ip" > "$WORKDIR/warp_best_endpoint.txt"
     echo "$best_port" > "$WORKDIR/warp_best_port.txt"
-    green "已保存优选结果到 warp_best_endpoint.txt"
-    
-    # 清理优选工具
-    rm -f "$warp_tool"
+    green "已保存优选结果"
     
     # 如果配置文件存在，更新配置中的 endpoint
     if [ -f "$WORKDIR/config.json" ]; then
@@ -818,7 +852,6 @@ optimize_warp_endpoint() {
             cp config.json config.json.bak.$(date +%Y%m%d%H%M%S)
             
             # 使用 sed 替换 endpoint
-            # 支持 IPv4 和 IPv6 格式
             if command -v jq >/dev/null 2>&1; then
                 # 使用 jq 更新
                 local tmp_file=$(mktemp)
@@ -828,7 +861,7 @@ optimize_warp_endpoint() {
                 ' config.json > "$tmp_file" && mv "$tmp_file" config.json
                 green "配置文件已更新 (使用 jq)"
             else
-                # 使用 sed 替换 (简单匹配)
+                # 使用 sed 替换
                 sed -i.tmp 's/"server": "[^"]*"/"server": "'"$best_ip"'"/g' config.json
                 sed -i.tmp 's/"server_port": [0-9]*/"server_port": '"$best_port"'/g' config.json
                 rm -f config.json.tmp
