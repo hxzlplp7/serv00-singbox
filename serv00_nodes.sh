@@ -664,16 +664,41 @@ optimize_warp_endpoint() {
     local os_type=$(uname -s | tr '[:upper:]' '[:lower:]')
     local download_url=""
     
+    # FreeBSD 不能直接运行 darwin/linux 二进制，需要使用Go源码编译或使用兼容层
+    # 这里尝试下载 darwin 版本，如果不行则提示用户
     if [[ "$os_type" == "freebsd" ]]; then
-        # FreeBSD 使用 darwin 版本 (兼容性较好)
+        yellow "检测到 FreeBSD 系统，尝试使用兼容工具..."
+        # 尝试使用 linux 版本 (部分 FreeBSD 有 Linux 兼容层)
+        download_url="https://gitlab.com/Misaka-blog/warp-script/-/raw/main/files/warp-yxip/warp-linux-${arch}"
+    elif [[ "$os_type" == "darwin" ]]; then
         download_url="https://gitlab.com/Misaka-blog/warp-script/-/raw/main/files/warp-yxip/warp-darwin-${arch}"
     else
-        download_url="https://gitlab.com/Misaka-blog/warp-script/-/raw/main/files/warp-yxip/warp-darwin-${arch}"
+        download_url="https://gitlab.com/Misaka-blog/warp-script/-/raw/main/files/warp-yxip/warp-linux-${arch}"
     fi
     
-    if ! curl -sL "$download_url" -o "$warp_tool" 2>/dev/null && \
-       ! wget -qO "$warp_tool" "$download_url" 2>/dev/null; then
+    yellow "下载地址: $download_url"
+    
+    # 尝试下载
+    local download_success=false
+    if curl -sL "$download_url" -o "$warp_tool" 2>&1; then
+        if [ -s "$warp_tool" ]; then
+            download_success=true
+        fi
+    fi
+    
+    if [ "$download_success" = false ]; then
+        if wget -qO "$warp_tool" "$download_url" 2>&1; then
+            if [ -s "$warp_tool" ]; then
+                download_success=true
+            fi
+        fi
+    fi
+    
+    # 检查下载结果
+    if [ "$download_success" = false ] || [ ! -s "$warp_tool" ]; then
         red "优选工具下载失败"
+        yellow "可能原因: 网络问题或下载地址不可用"
+        rm -f "$warp_tool"
         # 恢复服务
         if $warp_running && [ -n "$sb_binary" ] && [ -f "$sb_binary" ]; then
             nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
@@ -682,7 +707,17 @@ optimize_warp_endpoint() {
         return 1
     fi
     
+    # 显示文件大小
+    local file_size=$(ls -la "$warp_tool" | awk '{print $5}')
+    green "下载完成，文件大小: $file_size bytes"
+    
     chmod +x "$warp_tool"
+    
+    # 检查是否可执行
+    if ! file "$warp_tool" 2>/dev/null | grep -qi "executable\|ELF\|Mach-O"; then
+        yellow "警告: 文件可能不是有效的可执行文件"
+        file "$warp_tool" 2>/dev/null || echo "无法检测文件类型"
+    fi
     
     # 设置线程限制 (如果可用)
     ulimit -n 102400 2>/dev/null || true
@@ -691,17 +726,37 @@ optimize_warp_endpoint() {
     yellow "开始优选 Endpoint IP (这可能需要几分钟)..."
     echo
     
+    local execute_error=""
     if [[ "$ipv6_mode" == "6" ]]; then
         yellow "模式: IPv6 优选"
-        ./"$warp_tool" -ipv6 2>/dev/null || ./"$warp_tool" 2>/dev/null
+        execute_error=$(./"$warp_tool" -ipv6 2>&1) || execute_error=$(./"$warp_tool" 2>&1)
     else
         yellow "模式: IPv4 优选"
-        ./"$warp_tool" 2>/dev/null
+        execute_error=$(./"$warp_tool" 2>&1)
     fi
     
     # 检查结果
     if [ ! -f "$result_file" ]; then
         red "优选失败，未生成结果文件"
+        echo
+        yellow "=== 错误详情 ==="
+        if [ -n "$execute_error" ]; then
+            echo "$execute_error" | head -20
+        else
+            yellow "无错误输出"
+        fi
+        echo
+        yellow "=== 系统信息 ==="
+        yellow "系统: $(uname -s) $(uname -m)"
+        yellow "架构: $arch"
+        yellow "工作目录: $(pwd)"
+        ls -la "$warp_tool" 2>/dev/null || yellow "优选工具文件不存在"
+        echo
+        yellow "可能原因:"
+        yellow "  1. FreeBSD 系统不兼容 Linux/Darwin 二进制文件"
+        yellow "  2. 需要安装 Linux 兼容层 (linux_enable=YES)"
+        yellow "  3. 网络问题导致无法连接 WARP 服务器"
+        echo
         rm -f "$warp_tool"
         # 恢复服务
         if $warp_running && [ -n "$sb_binary" ] && [ -f "$sb_binary" ]; then
