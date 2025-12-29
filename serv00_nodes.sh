@@ -77,6 +77,16 @@ export ENABLE_HYSTERIA2=${ENABLE_HYSTERIA2:-true}
 export ENABLE_TUIC=${ENABLE_TUIC:-true}
 export ENABLE_SHADOWSOCKS=${ENABLE_SHADOWSOCKS:-false}
 
+# ==================== WARP 出站配置 ====================
+# 是否启用 WARP 出站 (默认关闭)
+WARP_ENABLED=${WARP_ENABLED:-false}
+# WARP 配置 (运行时从远程获取或使用备用)
+WARP_PRIVATE_KEY=""
+WARP_IPV6=""
+WARP_RESERVED=""
+# WARP 模式: all=全部流量走WARP, google=仅Google/YouTube走WARP
+WARP_MODE=${WARP_MODE:-"all"}
+
 # ==================== 脚本版本 ====================
 SCRIPT_VERSION="1.0.0"
 
@@ -266,45 +276,58 @@ check_port() {
         return 0
     fi
     
-    # Serv00/CT8: 原有逻辑
+    # Serv00/CT8: 根据用户选择的协议动态分配端口
     port_list=$(devil port list)
-    tcp_ports=$(echo "$port_list" | grep -c "tcp")
-    udp_ports=$(echo "$port_list" | grep -c "udp")
-
-    # 需要: 2个TCP (vmess, vless) + 2个UDP (hy2, tuic)
-    required_tcp=2
-    required_udp=2
+    tcp_ports_now=$(echo "$port_list" | grep -c "tcp")
+    udp_ports_now=$(echo "$port_list" | grep -c "udp")
     
-    if [[ $tcp_ports -ne $required_tcp || $udp_ports -ne $required_udp ]]; then
-        yellow "端口数量不符合要求，正在调整..."
+    # 计算需要的端口数量
+    required_tcp=0
+    required_udp=0
+    
+    # VMess-WS 直连需要 1 TCP (Trojan 共用)
+    [[ "$ENABLE_VMESS_WS" == "true" ]] && ((required_tcp++))
+    
+    # VLESS-Reality 需要 1 TCP
+    [[ "$ENABLE_VLESS_REALITY" == "true" ]] && ((required_tcp++))
+    
+    # Hysteria2 需要 1 UDP
+    [[ "$ENABLE_HYSTERIA2" == "true" ]] && ((required_udp++))
+    
+    # TUIC 需要 1 UDP (独立端口，不共用)
+    [[ "$ENABLE_TUIC" == "true" ]] && ((required_udp++))
+    
+    yellow "根据协议选择，需要: ${required_tcp} TCP + ${required_udp} UDP = $((required_tcp + required_udp)) 端口"
+    
+    if [[ $tcp_ports_now -ne $required_tcp || $udp_ports_now -ne $required_udp ]]; then
+        yellow "当前端口数量不符，正在调整..."
         
-        # Serv00/CT8: 删除多余的TCP端口
-        if [[ $tcp_ports -gt $required_tcp ]]; then
-            tcp_to_delete=$((tcp_ports - required_tcp))
+        # 删除多余的TCP端口
+        if [[ $tcp_ports_now -gt $required_tcp ]]; then
+            tcp_to_delete=$((tcp_ports_now - required_tcp))
             echo "$port_list" | awk '/tcp/ {print $1, $2}' | head -n $tcp_to_delete | while read port type; do
                 devil port del $type $port >/dev/null 2>&1
                 green "已删除TCP端口: $port"
             done
         fi
         
-        # Serv00/CT8: 删除多余的UDP端口
-        if [[ $udp_ports -gt $required_udp ]]; then
-            udp_to_delete=$((udp_ports - required_udp))
+        # 删除多余的UDP端口
+        if [[ $udp_ports_now -gt $required_udp ]]; then
+            udp_to_delete=$((udp_ports_now - required_udp))
             echo "$port_list" | awk '/udp/ {print $1, $2}' | head -n $udp_to_delete | while read port type; do
                 devil port del $type $port >/dev/null 2>&1
                 green "已删除UDP端口: $port"
             done
         fi
         
-        # 添加缺失的TCP端口 (检测占用)
-        if [[ $tcp_ports -lt $required_tcp ]]; then
-            tcp_ports_to_add=$((required_tcp - tcp_ports))
+        # 添加缺失的TCP端口
+        if [[ $tcp_ports_now -lt $required_tcp ]]; then
+            tcp_ports_to_add=$((required_tcp - tcp_ports_now))
             tcp_ports_added=0
             local retry_count=0
-            while [[ $tcp_ports_added -lt $tcp_ports_to_add && $retry_count -lt 20 ]]; do
+            while [[ $tcp_ports_added -lt $tcp_ports_to_add && $retry_count -lt 30 ]]; do
                 tcp_port=$(shuf -i 10000-65535 -n 1)
                 
-                # 先检查端口是否被占用
                 if check_port_in_use $tcp_port >/dev/null 2>&1; then
                     ((retry_count++))
                     continue
@@ -319,15 +342,14 @@ check_port() {
             done
         fi
         
-        # 添加缺失的UDP端口 (检测占用)
-        if [[ $udp_ports -lt $required_udp ]]; then
-            udp_ports_to_add=$((required_udp - udp_ports))
+        # 添加缺失的UDP端口
+        if [[ $udp_ports_now -lt $required_udp ]]; then
+            udp_ports_to_add=$((required_udp - udp_ports_now))
             udp_ports_added=0
             local retry_count=0
-            while [[ $udp_ports_added -lt $udp_ports_to_add && $retry_count -lt 20 ]]; do
+            while [[ $udp_ports_added -lt $udp_ports_to_add && $retry_count -lt 30 ]]; do
                 udp_port=$(shuf -i 10000-65535 -n 1)
                 
-                # 先检查端口是否被占用
                 if check_port_in_use $udp_port >/dev/null 2>&1; then
                     ((retry_count++))
                     continue
@@ -346,26 +368,57 @@ check_port() {
         port_list=$(devil port list)
     fi
     
-    # 获取端口分配
-    tcp_ports=$(echo "$port_list" | awk '/tcp/ {print $1}')
-    TCP_PORT1=$(echo "$tcp_ports" | sed -n '1p')
-    TCP_PORT2=$(echo "$tcp_ports" | sed -n '2p')
+    # 获取端口列表
+    tcp_ports_list=$(echo "$port_list" | awk '/tcp/ {print $1}')
+    udp_ports_list=$(echo "$port_list" | awk '/udp/ {print $1}')
     
-    udp_ports=$(echo "$port_list" | awk '/udp/ {print $1}')
-    UDP_PORT1=$(echo "$udp_ports" | sed -n '1p')
-    UDP_PORT2=$(echo "$udp_ports" | sed -n '2p')
+    TCP_PORT1=$(echo "$tcp_ports_list" | sed -n '1p')
+    TCP_PORT2=$(echo "$tcp_ports_list" | sed -n '2p')
+    UDP_PORT1=$(echo "$udp_ports_list" | sed -n '1p')
+    UDP_PORT2=$(echo "$udp_ports_list" | sed -n '2p')
     
-    # 分配端口给协议
-    export VMESS_PORT=$TCP_PORT1
-    export VLESS_PORT=$TCP_PORT2
-    export HY2_PORT=$UDP_PORT1
-    export TUIC_PORT=$UDP_PORT2
+    # 根据协议分配端口
+    local tcp_idx=1
+    local udp_idx=1
     
+    # VMess-WS / Trojan 分配第一个TCP
+    if [[ "$ENABLE_VMESS_WS" == "true" ]]; then
+        export VMESS_PORT=$TCP_PORT1
+        ((tcp_idx++))
+    fi
+    
+    # VLESS-Reality 分配下一个TCP
+    if [[ "$ENABLE_VLESS_REALITY" == "true" ]]; then
+        if [[ $tcp_idx -eq 1 ]]; then
+            export VLESS_PORT=$TCP_PORT1
+        else
+            export VLESS_PORT=$TCP_PORT2
+        fi
+        ((tcp_idx++))
+    fi
+    
+    # Hysteria2 分配第一个UDP
+    if [[ "$ENABLE_HYSTERIA2" == "true" ]]; then
+        export HY2_PORT=$UDP_PORT1
+        ((udp_idx++))
+    fi
+    
+    # TUIC 分配下一个UDP (独立端口)
+    if [[ "$ENABLE_TUIC" == "true" ]]; then
+        if [[ $udp_idx -eq 1 ]]; then
+            export TUIC_PORT=$UDP_PORT1
+        else
+            export TUIC_PORT=$UDP_PORT2
+        fi
+        ((udp_idx++))
+    fi
+    
+    echo
     purple "端口分配:"
-    purple "  VMess-WS/Trojan: $VMESS_PORT (TCP)"
-    purple "  VLESS-Reality:   $VLESS_PORT (TCP)"
-    purple "  Hysteria2:       $HY2_PORT (UDP)"
-    purple "  TUIC v5:         $TUIC_PORT (UDP)"
+    [[ -n "$VMESS_PORT" ]] && purple "  VMess-WS/Trojan: $VMESS_PORT (TCP)"
+    [[ -n "$VLESS_PORT" ]] && purple "  VLESS-Reality:   $VLESS_PORT (TCP)"
+    [[ -n "$HY2_PORT" ]] && purple "  Hysteria2:       $HY2_PORT (UDP)"
+    [[ -n "$TUIC_PORT" ]] && purple "  TUIC v5:         $TUIC_PORT (UDP)"
     
     # 检测端口占用情况 (仅Serv00)
     echo
@@ -489,6 +542,113 @@ generate_reality_keys() {
     fi
     export REALITY_PRIVATE_KEY=$(cat private_key.txt 2>/dev/null)
     export REALITY_PUBLIC_KEY=$(cat public_key.txt 2>/dev/null)
+}
+
+# ==================== WARP 出站函数 ====================
+
+# 初始化/获取 WARP 配置 (参照 argosbx)
+init_warp_config() {
+    yellow "获取 WARP 配置..."
+    
+    # 尝试从勇哥的 API 获取预注册配置
+    local warpurl=""
+    warpurl=$(curl -sm5 -k https://ygkkk-warp.renky.eu.org 2>/dev/null) || \
+    warpurl=$(wget -qO- --timeout=5 https://ygkkk-warp.renky.eu.org 2>/dev/null)
+    
+    if echo "$warpurl" | grep -q ygkkk; then
+        WARP_PRIVATE_KEY=$(echo "$warpurl" | awk -F'：' '/Private_key/{print $2}' | xargs)
+        WARP_IPV6=$(echo "$warpurl" | awk -F'：' '/IPV6/{print $2}' | xargs)
+        WARP_RESERVED=$(echo "$warpurl" | awk -F'：' '/reserved/{print $2}' | xargs)
+        green "WARP 配置获取成功 (远程API)"
+    else
+        # 备用硬编码配置 (和 argosbx 一样)
+        WARP_IPV6='2606:4700:110:8d8d:1845:c39f:2dd5:a03a'
+        WARP_PRIVATE_KEY='52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A='
+        WARP_RESERVED='[215, 69, 233]'
+        green "WARP 配置获取成功 (备用配置)"
+    fi
+    
+    # 保存配置供后续使用
+    echo "$WARP_PRIVATE_KEY" > "$WORKDIR/warp_private_key.txt"
+    echo "$WARP_RESERVED" > "$WORKDIR/warp_reserved.txt"
+    echo "$WARP_IPV6" > "$WORKDIR/warp_ipv6.txt"
+    
+    return 0
+}
+
+# 获取 WARP Endpoint 配置 (检测网络环境选择最佳 Endpoint)
+get_warp_endpoint() {
+    local has_ipv4=false
+    local has_ipv6=false
+    
+    # 检测网络环境 (FreeBSD 兼容)
+    curl -s4m2 https://www.cloudflare.com/cdn-cgi/trace -k 2>/dev/null | grep -q "warp\|h=" && has_ipv4=true
+    curl -s6m2 https://www.cloudflare.com/cdn-cgi/trace -k 2>/dev/null | grep -q "warp\|h=" && has_ipv6=true
+    
+    # 备用检测 (FreeBSD 使用 ifconfig)
+    if [ "$has_ipv4" = false ] && [ "$has_ipv6" = false ]; then
+        if command -v ip >/dev/null 2>&1; then
+            ip -4 route show default 2>/dev/null | grep -q default && has_ipv4=true
+            ip -6 route show default 2>/dev/null | grep -q default && has_ipv6=true
+        else
+            # FreeBSD
+            netstat -rn 2>/dev/null | grep -q "^default.*[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+" && has_ipv4=true
+            netstat -rn 2>/dev/null | grep -q "^default.*:" && has_ipv6=true
+        fi
+    fi
+    
+    if [ "$has_ipv6" = true ] && [ "$has_ipv4" = false ]; then
+        # 纯 IPv6 环境
+        echo "2606:4700:d0::a29f:c001"
+    else
+        # IPv4 或双栈，使用优选 IP
+        echo "162.159.192.1"
+    fi
+}
+
+# 询问是否启用 WARP 出站
+ask_warp_outbound() {
+    echo
+    green "==== WARP 出站配置 ===="
+    yellow "WARP 可以解锁流媒体、隐藏服务器真实IP"
+    echo
+    yellow "选项:"
+    yellow "  0. 不使用 WARP (默认)"
+    yellow "  1. 全部流量走 WARP"
+    yellow "  2. 仅 Google/YouTube 走 WARP (分流)"
+    reading "请选择 0-2: " warp_choice
+    
+    case "$warp_choice" in
+        1)
+            if init_warp_config; then
+                WARP_ENABLED=true
+                WARP_MODE="all"
+                green "已启用 WARP 出站 (全部流量)"
+            else
+                WARP_ENABLED=false
+                red "WARP 配置失败，将使用直连出站"
+            fi
+            ;;
+        2)
+            if init_warp_config; then
+                WARP_ENABLED=true
+                WARP_MODE="google"
+                green "已启用 WARP 出站 (仅 Google/YouTube)"
+            else
+                WARP_ENABLED=false
+                red "WARP 配置失败，将使用直连出站"
+            fi
+            ;;
+        *)
+            WARP_ENABLED=false
+            WARP_MODE=""
+            green "使用直连出站 (不使用 WARP)"
+            ;;
+    esac
+    
+    # 保存设置
+    echo "$WARP_ENABLED" > "$WORKDIR/warp_enabled.txt"
+    echo "$WARP_MODE" > "$WORKDIR/warp_mode.txt"
 }
 
 # ==================== 下载函数 ====================
@@ -674,50 +834,291 @@ configure_argo() {
 }
 
 # 选择协议
+# 计算当前选择的端口占用
+calculate_port_usage() {
+    local tcp_count=0
+    local udp_count=0
+    
+    # VMess-WS 直连需要 1 TCP (Trojan共用)
+    [[ "$ENABLE_VMESS_WS" == "true" ]] && ((tcp_count++))
+    
+    # VLESS-Reality 需要 1 TCP
+    [[ "$ENABLE_VLESS_REALITY" == "true" ]] && ((tcp_count++))
+    
+    # Hysteria2 需要 1 UDP
+    [[ "$ENABLE_HYSTERIA2" == "true" ]] && ((udp_count++))
+    
+    # TUIC 需要 1 UDP
+    [[ "$ENABLE_TUIC" == "true" ]] && ((udp_count++))
+    
+    # Shadowsocks 需要额外 1 TCP (如果没有VMess则独占，有VMess则+1)
+    if [[ "$ENABLE_SHADOWSOCKS" == "true" ]]; then
+        if [[ "$ENABLE_VMESS_WS" != "true" ]]; then
+            ((tcp_count++))
+        fi
+        # SS 共用 VMess 端口 +1，不额外计算
+    fi
+    
+    # Argo 不占端口
+    # Trojan-WS 共用 VMess 端口，不额外计算
+    
+    echo "$((tcp_count + udp_count))"
+}
+
+# 选择协议 (支持端口限制)
 select_protocols() {
     echo
     green "==== 选择要安装的协议 ===="
     echo
     
-    yellow "可用协议:"
-    yellow "  1. Argo隧道 (VMess-WS over CloudFlare)"
-    yellow "  2. VLESS-Reality-Vision"
-    yellow "  3. VMess-WS (直连)"
-    yellow "  4. Trojan-WS"
-    yellow "  5. Hysteria2"
-    yellow "  6. TUIC v5"
-    yellow "  7. Shadowsocks-2022"
-    echo
-    yellow "默认安装: Argo + VLESS-Reality + VMess-WS + Hysteria2 + TUIC"
-    reading "是否使用默认配置? (Y/n): " use_default
+    # 判断端口限制
+    local max_ports=99
+    if [[ "$PLATFORM" == "serv00" ]] || [[ "$PLATFORM" == "ct8" ]]; then
+        max_ports=3
+        yellow "⚠ Serv00/CT8 端口限制: 最多 3 个端口"
+        echo
+        blue "端口占用说明:"
+        blue "  • Argo隧道: 0 端口 (走CF隧道，推荐!)"
+        blue "  • VLESS-Reality: 1 TCP"
+        blue "  • VMess-WS直连: 1 TCP (Trojan共用此端口)"
+        blue "  • Hysteria2: 1 UDP"
+        blue "  • TUIC v5: 1 UDP"
+        blue "  • Shadowsocks: 使用VMess端口"
+        echo
+        green "推荐组合 (3端口): Argo + VLESS + Hy2 + TUIC"
+        echo
+    fi
     
-    if [[ "$use_default" =~ ^[Nn]$ ]]; then
-        reading "启用Argo隧道? (Y/n): " en_argo
-        reading "启用VLESS-Reality? (Y/n): " en_vless
-        reading "启用VMess-WS? (Y/n): " en_vmess
-        reading "启用Trojan-WS? (y/N): " en_trojan
-        reading "启用Hysteria2? (Y/n): " en_hy2
-        reading "启用TUIC v5? (Y/n): " en_tuic
-        reading "启用Shadowsocks-2022? (y/N): " en_ss
-        
-        [[ "$en_argo" =~ ^[Nn]$ ]] && ENABLE_ARGO=false
-        [[ "$en_vless" =~ ^[Nn]$ ]] && ENABLE_VLESS_REALITY=false
-        [[ "$en_vmess" =~ ^[Nn]$ ]] && ENABLE_VMESS_WS=false
-        [[ "$en_trojan" =~ ^[Yy]$ ]] && ENABLE_TROJAN_WS=true
-        [[ "$en_hy2" =~ ^[Nn]$ ]] && ENABLE_HYSTERIA2=false
-        [[ "$en_tuic" =~ ^[Nn]$ ]] && ENABLE_TUIC=false
-        [[ "$en_ss" =~ ^[Yy]$ ]] && ENABLE_SHADOWSOCKS=true
+    # 初始化默认值
+    ENABLE_ARGO=false
+    ENABLE_VLESS_REALITY=false
+    ENABLE_VMESS_WS=false
+    ENABLE_TROJAN_WS=false
+    ENABLE_HYSTERIA2=false
+    ENABLE_TUIC=false
+    ENABLE_SHADOWSOCKS=false
+    
+    yellow "选择安装方式:"
+    yellow "  1. 使用推荐组合 (Argo + VLESS + Hy2 + TUIC)"
+    yellow "  2. 自定义选择协议"
+    reading "请选择 [1-2]: " install_mode
+    
+    if [[ "$install_mode" != "2" ]]; then
+        # 推荐组合
+        ENABLE_ARGO=true
+        ENABLE_VLESS_REALITY=true
+        ENABLE_HYSTERIA2=true
+        ENABLE_TUIC=true
+    else
+        # 自定义选择 - 交互式菜单
+        while true; do
+            clear
+            echo
+            green "============================================================"
+            green "  自定义协议选择 (Serv00 限制: $max_ports 端口)"
+            green "============================================================"
+            
+            local current_ports=$(calculate_port_usage)
+            
+            if [[ $current_ports -gt $max_ports ]]; then
+                red "当前端口占用: $current_ports / $max_ports ⚠ 超出限制!"
+            elif [[ $current_ports -eq $max_ports ]]; then
+                yellow "当前端口占用: $current_ports / $max_ports (已满)"
+            else
+                green "当前端口占用: $current_ports / $max_ports"
+            fi
+            echo
+            
+            purple "协议列表 (✓=已选, ✗=未选):"
+            echo
+            
+            # 1. Argo (0端口)
+            if [[ "$ENABLE_ARGO" == "true" ]]; then
+                green "  [1] [✓] Argo隧道 (VMess-WS over CF) - 0端口 ★推荐"
+            else
+                yellow "  [1] [✗] Argo隧道 (VMess-WS over CF) - 0端口 ★推荐"
+            fi
+            
+            # 2. VLESS-Reality (1 TCP)
+            if [[ "$ENABLE_VLESS_REALITY" == "true" ]]; then
+                green "  [2] [✓] VLESS-Reality - 1 TCP"
+            else
+                yellow "  [2] [✗] VLESS-Reality - 1 TCP"
+            fi
+            
+            # 3. VMess-WS直连 (1 TCP)
+            if [[ "$ENABLE_VMESS_WS" == "true" ]]; then
+                green "  [3] [✓] VMess-WS (直连) - 1 TCP"
+            else
+                yellow "  [3] [✗] VMess-WS (直连) - 1 TCP"
+            fi
+            
+            # 4. Trojan-WS (共用VMess端口)
+            if [[ "$ENABLE_TROJAN_WS" == "true" ]]; then
+                green "  [4] [✓] Trojan-WS - 共用VMess端口"
+            else
+                yellow "  [4] [✗] Trojan-WS - 共用VMess端口"
+            fi
+            
+            # 5. Hysteria2 (1 UDP)
+            if [[ "$ENABLE_HYSTERIA2" == "true" ]]; then
+                green "  [5] [✓] Hysteria2 - 1 UDP ★推荐"
+            else
+                yellow "  [5] [✗] Hysteria2 - 1 UDP ★推荐"
+            fi
+            
+            # 6. TUIC (1 UDP)
+            if [[ "$ENABLE_TUIC" == "true" ]]; then
+                green "  [6] [✓] TUIC v5 - 1 UDP ★推荐"
+            else
+                yellow "  [6] [✗] TUIC v5 - 1 UDP ★推荐"
+            fi
+            
+            # 7. Shadowsocks (使用VMess端口)
+            if [[ "$ENABLE_SHADOWSOCKS" == "true" ]]; then
+                green "  [7] [✓] Shadowsocks-2022 - 使用VMess端口"
+            else
+                yellow "  [7] [✗] Shadowsocks-2022 - 使用VMess端口"
+            fi
+            
+            echo
+            echo "------------------------------------------------------------"
+            blue "  a. 全选推荐组合 (Argo+VLESS+Hy2+TUIC)"
+            blue "  n. 清空所有选择"
+            green "  d. 完成选择，继续安装"
+            echo "============================================================"
+            echo
+            reading "输入数字切换选择 [1-7/a/n/d]: " choice
+            
+            case "$choice" in
+                1)
+                    [[ "$ENABLE_ARGO" == "true" ]] && ENABLE_ARGO=false || ENABLE_ARGO=true
+                    ;;
+                2)
+                    if [[ "$ENABLE_VLESS_REALITY" == "true" ]]; then
+                        ENABLE_VLESS_REALITY=false
+                    else
+                        # 检查是否超出端口限制
+                        ENABLE_VLESS_REALITY=true
+                        if [[ $(calculate_port_usage) -gt $max_ports ]]; then
+                            red "超出端口限制! 请先取消其他协议"
+                            ENABLE_VLESS_REALITY=false
+                            sleep 1
+                        fi
+                    fi
+                    ;;
+                3)
+                    if [[ "$ENABLE_VMESS_WS" == "true" ]]; then
+                        ENABLE_VMESS_WS=false
+                        # 如果关闭VMess，Trojan也要关闭
+                        ENABLE_TROJAN_WS=false
+                    else
+                        ENABLE_VMESS_WS=true
+                        if [[ $(calculate_port_usage) -gt $max_ports ]]; then
+                            red "超出端口限制! 请先取消其他协议"
+                            ENABLE_VMESS_WS=false
+                            sleep 1
+                        fi
+                    fi
+                    ;;
+                4)
+                    if [[ "$ENABLE_VMESS_WS" != "true" ]]; then
+                        yellow "Trojan需要先启用VMess-WS (共用端口)"
+                        sleep 1
+                    else
+                        [[ "$ENABLE_TROJAN_WS" == "true" ]] && ENABLE_TROJAN_WS=false || ENABLE_TROJAN_WS=true
+                    fi
+                    ;;
+                5)
+                    if [[ "$ENABLE_HYSTERIA2" == "true" ]]; then
+                        ENABLE_HYSTERIA2=false
+                    else
+                        ENABLE_HYSTERIA2=true
+                        if [[ $(calculate_port_usage) -gt $max_ports ]]; then
+                            red "超出端口限制! 请先取消其他协议"
+                            ENABLE_HYSTERIA2=false
+                            sleep 1
+                        fi
+                    fi
+                    ;;
+                6)
+                    if [[ "$ENABLE_TUIC" == "true" ]]; then
+                        ENABLE_TUIC=false
+                    else
+                        ENABLE_TUIC=true
+                        if [[ $(calculate_port_usage) -gt $max_ports ]]; then
+                            red "超出端口限制! 请先取消其他协议"
+                            ENABLE_TUIC=false
+                            sleep 1
+                        fi
+                    fi
+                    ;;
+                7)
+                    if [[ "$ENABLE_VMESS_WS" != "true" ]]; then
+                        yellow "Shadowsocks需要先启用VMess-WS (使用其端口)"
+                        sleep 1
+                    else
+                        [[ "$ENABLE_SHADOWSOCKS" == "true" ]] && ENABLE_SHADOWSOCKS=false || ENABLE_SHADOWSOCKS=true
+                    fi
+                    ;;
+                a|A)
+                    # 推荐组合
+                    ENABLE_ARGO=true
+                    ENABLE_VLESS_REALITY=true
+                    ENABLE_VMESS_WS=false
+                    ENABLE_TROJAN_WS=false
+                    ENABLE_HYSTERIA2=true
+                    ENABLE_TUIC=true
+                    ENABLE_SHADOWSOCKS=false
+                    ;;
+                n|N)
+                    ENABLE_ARGO=false
+                    ENABLE_VLESS_REALITY=false
+                    ENABLE_VMESS_WS=false
+                    ENABLE_TROJAN_WS=false
+                    ENABLE_HYSTERIA2=false
+                    ENABLE_TUIC=false
+                    ENABLE_SHADOWSOCKS=false
+                    ;;
+                d|D)
+                    # 检查是否有选择
+                    if [[ "$ENABLE_ARGO" != "true" ]] && [[ "$ENABLE_VLESS_REALITY" != "true" ]] && \
+                       [[ "$ENABLE_VMESS_WS" != "true" ]] && [[ "$ENABLE_HYSTERIA2" != "true" ]] && \
+                       [[ "$ENABLE_TUIC" != "true" ]]; then
+                        red "请至少选择一个协议!"
+                        sleep 1
+                        continue
+                    fi
+                    # 检查端口是否超限
+                    if [[ $(calculate_port_usage) -gt $max_ports ]]; then
+                        red "端口超出限制! 请调整选择"
+                        sleep 1
+                        continue
+                    fi
+                    break
+                    ;;
+                *)
+                    red "无效选项"
+                    sleep 0.5
+                    ;;
+            esac
+        done
     fi
     
     echo
     green "已启用的协议:"
-    [[ "$ENABLE_ARGO" == "true" ]] && purple "  ✓ Argo隧道"
-    [[ "$ENABLE_VLESS_REALITY" == "true" ]] && purple "  ✓ VLESS-Reality"
-    [[ "$ENABLE_VMESS_WS" == "true" ]] && purple "  ✓ VMess-WS"
-    [[ "$ENABLE_TROJAN_WS" == "true" ]] && purple "  ✓ Trojan-WS"
-    [[ "$ENABLE_HYSTERIA2" == "true" ]] && purple "  ✓ Hysteria2"
-    [[ "$ENABLE_TUIC" == "true" ]] && purple "  ✓ TUIC v5"
-    [[ "$ENABLE_SHADOWSOCKS" == "true" ]] && purple "  ✓ Shadowsocks-2022"
+    [[ "$ENABLE_ARGO" == "true" ]] && purple "  ✓ Argo隧道 (0端口)"
+    [[ "$ENABLE_VLESS_REALITY" == "true" ]] && purple "  ✓ VLESS-Reality (1 TCP)"
+    [[ "$ENABLE_VMESS_WS" == "true" ]] && purple "  ✓ VMess-WS (1 TCP)"
+    [[ "$ENABLE_TROJAN_WS" == "true" ]] && purple "  ✓ Trojan-WS (共用VMess端口)"
+    [[ "$ENABLE_HYSTERIA2" == "true" ]] && purple "  ✓ Hysteria2 (1 UDP)"
+    [[ "$ENABLE_TUIC" == "true" ]] && purple "  ✓ TUIC v5 (1 UDP)"
+    [[ "$ENABLE_SHADOWSOCKS" == "true" ]] && purple "  ✓ Shadowsocks-2022 (共用VMess端口)"
+    
+    green "端口占用: $(calculate_port_usage) 个"
+    
+    # 询问 WARP 出站配置
+    ask_warp_outbound
 }
 
 # 生成sing-box配置
@@ -887,8 +1288,116 @@ EOF
   ],
 EOF
 
-    # 检查s14/s15服务器，需要warp访问Google/YouTube
-    if [[ "$HOSTNAME" =~ s14|s15 ]]; then
+    # 获取 WARP endpoint
+    local warp_endpoint=$(get_warp_endpoint)
+    local warp_ipv6="${WARP_IPV6:-2606:4700:110:8d8d:1845:c39f:2dd5:a03a}"
+    local warp_private_key="${WARP_PRIVATE_KEY:-52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A=}"
+    local warp_reserved="${WARP_RESERVED:-[215, 69, 233]}"
+
+    # 根据 WARP 配置生成 outbounds
+    if [[ "$WARP_ENABLED" == "true" ]] && [[ "$WARP_MODE" == "all" ]]; then
+        # 全部流量走 WARP
+        yellow "配置: 全部流量通过 WARP 出站"
+        cat >> config.json <<EOF
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    },
+    {
+      "type": "wireguard",
+      "tag": "warp-out",
+      "server": "$warp_endpoint",
+      "server_port": 2408,
+      "local_address": [
+        "172.16.0.2/32",
+        "${warp_ipv6}/128"
+      ],
+      "private_key": "${warp_private_key}",
+      "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+      "reserved": ${warp_reserved}
+    }
+  ],
+  "route": {
+    "final": "warp-out"
+  }
+}
+EOF
+    elif [[ "$WARP_ENABLED" == "true" ]] && [[ "$WARP_MODE" == "google" ]]; then
+        # 仅 Google/YouTube 走 WARP
+        yellow "配置: Google/YouTube 通过 WARP 出站"
+        cat >> config.json <<EOF
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    },
+    {
+      "type": "wireguard",
+      "tag": "warp-out",
+      "server": "$warp_endpoint",
+      "server_port": 2408,
+      "local_address": [
+        "172.16.0.2/32",
+        "${warp_ipv6}/128"
+      ],
+      "private_key": "${warp_private_key}",
+      "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+      "reserved": ${warp_reserved}
+    }
+  ],
+  "route": {
+    "rule_set": [
+      {
+        "tag": "youtube",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs",
+        "download_detour": "direct"
+      },
+      {
+        "tag": "google",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/google.srs",
+        "download_detour": "direct"
+      },
+      {
+        "tag": "openai",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/openai.srs",
+        "download_detour": "direct"
+      },
+      {
+        "tag": "netflix",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs",
+        "download_detour": "direct"
+      }
+    ],
+    "rules": [
+      {
+        "rule_set": ["google", "youtube", "openai", "netflix"],
+        "outbound": "warp-out"
+      }
+    ],
+    "final": "direct"
+  }
+}
+EOF
+    elif [[ "$HOSTNAME" =~ s14|s15 ]]; then
+        # 特殊服务器(s14/s15)保留原有逻辑
+        yellow "S14/S15服务器: 使用默认WARP分流 (Google/YouTube)"
         cat >> config.json <<EOF
   "outbounds": [
     {
@@ -941,6 +1450,7 @@ EOF
 }
 EOF
     else
+        # 默认直连出站
         cat >> config.json <<EOF
   "outbounds": [
     {
@@ -1237,10 +1747,10 @@ generate_links() {
     echo "UUID: $UUID" >> list.txt
     echo "" >> list.txt
     echo "端口分配:" >> list.txt
-    echo "  VMess/Trojan Port: $VMESS_PORT" >> list.txt
-    echo "  VLESS-Reality Port: $VLESS_PORT" >> list.txt
-    echo "  Hysteria2 Port: $HY2_PORT" >> list.txt
-    echo "  TUIC Port: $TUIC_PORT" >> list.txt
+    [[ -n "$VMESS_PORT" ]] && echo "  VMess/Trojan: $VMESS_PORT (TCP)" >> list.txt
+    [[ -n "$VLESS_PORT" ]] && echo "  VLESS-Reality: $VLESS_PORT (TCP)" >> list.txt
+    [[ -n "$HY2_PORT" ]] && echo "  Hysteria2: $HY2_PORT (UDP)" >> list.txt
+    [[ -n "$TUIC_PORT" ]] && echo "  TUIC v5: $TUIC_PORT (UDP)" >> list.txt
     echo "" >> list.txt
     
     local node_count=0
@@ -1403,10 +1913,446 @@ generate_links() {
 # 显示链接
 show_links() {
     if [ -f "$WORKDIR/list.txt" ]; then
+        # 显示WARP状态
+        local warp_status=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null)
+        local warp_mode=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null)
+        echo
+        if [[ "$warp_status" == "true" ]]; then
+            if [[ "$warp_mode" == "all" ]]; then
+                blue "╔════════════════════════════════════════════╗"
+                blue "║  WARP 出站: ✓ 已启用 (全部流量)            ║"
+                blue "╚════════════════════════════════════════════╝"
+            else
+                blue "╔════════════════════════════════════════════╗"
+                blue "║  WARP 出站: ✓ 已启用 (Google/YouTube/Netflix/OpenAI) ║"
+                blue "╚════════════════════════════════════════════╝"
+            fi
+        else
+            purple "╔════════════════════════════════════════════╗"
+            purple "║  WARP 出站: ✗ 未启用 (直连)               ║"
+            purple "╚════════════════════════════════════════════╝"
+        fi
+        echo
         cat "$WORKDIR/list.txt"
     else
         red "未找到节点信息，请先安装"
     fi
+}
+
+# ==================== 自定义节点推送 ====================
+
+# 自定义选择节点组合推送
+custom_push_nodes() {
+    if [ ! -f "$WORKDIR/links.txt" ]; then
+        red "未找到节点信息，请先安装"
+        return 1
+    fi
+    
+    cd "$WORKDIR"
+    
+    # 读取当前启用的协议
+    local has_vless=$(cat "$WORKDIR/enable_vless.txt" 2>/dev/null)
+    local has_vmess=$(cat "$WORKDIR/enable_vmess.txt" 2>/dev/null)
+    local has_argo=$(cat "$WORKDIR/enable_argo.txt" 2>/dev/null)
+    local has_trojan=$(cat "$WORKDIR/enable_trojan.txt" 2>/dev/null)
+    local has_hy2=$(cat "$WORKDIR/enable_hy2.txt" 2>/dev/null)
+    local has_tuic=$(cat "$WORKDIR/enable_tuic.txt" 2>/dev/null)
+    local has_ss=$(cat "$WORKDIR/enable_ss.txt" 2>/dev/null)
+    
+    # 初始化选择状态 (默认全选)
+    local sel_vless=${has_vless:-false}
+    local sel_vmess=${has_vmess:-false}
+    local sel_argo=${has_argo:-false}
+    local sel_trojan=${has_trojan:-false}
+    local sel_hy2=${has_hy2:-false}
+    local sel_tuic=${has_tuic:-false}
+    local sel_ss=${has_ss:-false}
+    
+    # 选择菜单循环
+    while true; do
+        clear
+        echo
+        green "============================================================"
+        green "  自定义节点组合推送"
+        green "============================================================"
+        echo
+        purple "当前选择 (✓=已选, ✗=未选):"  
+        echo
+        
+        # 显示可用协议
+        local idx=1
+        
+        if [[ "$has_vless" == "true" ]]; then
+            if [[ "$sel_vless" == "true" ]]; then
+                green "  [$idx] [✓] VLESS-Reality"
+            else
+                yellow "  [$idx] [✗] VLESS-Reality"
+            fi
+            ((idx++))
+        fi
+        
+        if [[ "$has_vmess" == "true" ]]; then
+            if [[ "$sel_vmess" == "true" ]]; then
+                green "  [$idx] [✓] VMess-WS (直连)"
+            else
+                yellow "  [$idx] [✗] VMess-WS (直连)"
+            fi
+            ((idx++))
+        fi
+        
+        if [[ "$has_argo" == "true" ]]; then
+            if [[ "$sel_argo" == "true" ]]; then
+                green "  [$idx] [✓] VMess-WS-Argo (含CDN节点)"
+            else
+                yellow "  [$idx] [✗] VMess-WS-Argo (含CDN节点)"
+            fi
+            ((idx++))
+        fi
+        
+        if [[ "$has_trojan" == "true" ]]; then
+            if [[ "$sel_trojan" == "true" ]]; then
+                green "  [$idx] [✓] Trojan-WS"
+            else
+                yellow "  [$idx] [✗] Trojan-WS"
+            fi
+            ((idx++))
+        fi
+        
+        if [[ "$has_hy2" == "true" ]]; then
+            if [[ "$sel_hy2" == "true" ]]; then
+                green "  [$idx] [✓] Hysteria2"
+            else
+                yellow "  [$idx] [✗] Hysteria2"
+            fi
+            ((idx++))
+        fi
+        
+        if [[ "$has_tuic" == "true" ]]; then
+            if [[ "$sel_tuic" == "true" ]]; then
+                green "  [$idx] [✓] TUIC v5"
+            else
+                yellow "  [$idx] [✗] TUIC v5"
+            fi
+            ((idx++))
+        fi
+        
+        if [[ "$has_ss" == "true" ]]; then
+            if [[ "$sel_ss" == "true" ]]; then
+                green "  [$idx] [✓] Shadowsocks-2022"
+            else
+                yellow "  [$idx] [✗] Shadowsocks-2022"
+            fi
+            ((idx++))
+        fi
+        
+        echo
+        echo "------------------------------------------------------------"
+        blue "  a. 全选所有协议"
+        blue "  n. 取消全选"
+        green "  g. 生成并推送选中的节点"
+        red "  0. 返回主菜单"
+        echo "============================================================"
+        echo
+        reading "输入数字切换选择，或选择操作 [1-$((idx-1))/a/n/g/0]: " choice
+        
+        # 处理输入
+        case "$choice" in
+            a|A)
+                # 全选
+                [[ "$has_vless" == "true" ]] && sel_vless=true
+                [[ "$has_vmess" == "true" ]] && sel_vmess=true
+                [[ "$has_argo" == "true" ]] && sel_argo=true
+                [[ "$has_trojan" == "true" ]] && sel_trojan=true
+                [[ "$has_hy2" == "true" ]] && sel_hy2=true
+                [[ "$has_tuic" == "true" ]] && sel_tuic=true
+                [[ "$has_ss" == "true" ]] && sel_ss=true
+                green "已全选"
+                sleep 0.5
+                ;;
+            n|N)
+                # 取消全选
+                sel_vless=false
+                sel_vmess=false
+                sel_argo=false
+                sel_trojan=false
+                sel_hy2=false
+                sel_tuic=false
+                sel_ss=false
+                yellow "已取消全选"
+                sleep 0.5
+                ;;
+            g|G)
+                # 生成推送
+                generate_custom_subscription "$sel_vless" "$sel_vmess" "$sel_argo" "$sel_trojan" "$sel_hy2" "$sel_tuic" "$sel_ss"
+                reading "按回车返回..." _
+                ;;
+            0)
+                return 0
+                ;;
+            [1-9])
+                # 切换选择
+                local toggle_idx=1
+                
+                if [[ "$has_vless" == "true" ]]; then
+                    if [[ "$choice" == "$toggle_idx" ]]; then
+                        [[ "$sel_vless" == "true" ]] && sel_vless=false || sel_vless=true
+                    fi
+                    ((toggle_idx++))
+                fi
+                
+                if [[ "$has_vmess" == "true" ]]; then
+                    if [[ "$choice" == "$toggle_idx" ]]; then
+                        [[ "$sel_vmess" == "true" ]] && sel_vmess=false || sel_vmess=true
+                    fi
+                    ((toggle_idx++))
+                fi
+                
+                if [[ "$has_argo" == "true" ]]; then
+                    if [[ "$choice" == "$toggle_idx" ]]; then
+                        [[ "$sel_argo" == "true" ]] && sel_argo=false || sel_argo=true
+                    fi
+                    ((toggle_idx++))
+                fi
+                
+                if [[ "$has_trojan" == "true" ]]; then
+                    if [[ "$choice" == "$toggle_idx" ]]; then
+                        [[ "$sel_trojan" == "true" ]] && sel_trojan=false || sel_trojan=true
+                    fi
+                    ((toggle_idx++))
+                fi
+                
+                if [[ "$has_hy2" == "true" ]]; then
+                    if [[ "$choice" == "$toggle_idx" ]]; then
+                        [[ "$sel_hy2" == "true" ]] && sel_hy2=false || sel_hy2=true
+                    fi
+                    ((toggle_idx++))
+                fi
+                
+                if [[ "$has_tuic" == "true" ]]; then
+                    if [[ "$choice" == "$toggle_idx" ]]; then
+                        [[ "$sel_tuic" == "true" ]] && sel_tuic=false || sel_tuic=true
+                    fi
+                    ((toggle_idx++))
+                fi
+                
+                if [[ "$has_ss" == "true" ]]; then
+                    if [[ "$choice" == "$toggle_idx" ]]; then
+                        [[ "$sel_ss" == "true" ]] && sel_ss=false || sel_ss=true
+                    fi
+                    ((toggle_idx++))
+                fi
+                ;;
+            *)
+                red "无效选项"
+                sleep 0.5
+                ;;
+        esac
+    done
+}
+
+# 根据选择生成自定义订阅
+generate_custom_subscription() {
+    local sel_vless=$1
+    local sel_vmess=$2
+    local sel_argo=$3
+    local sel_trojan=$4
+    local sel_hy2=$5
+    local sel_tuic=$6
+    local sel_ss=$7
+    
+    cd "$WORKDIR"
+    
+    # 检查是否有选择
+    if [[ "$sel_vless" != "true" ]] && [[ "$sel_vmess" != "true" ]] && \
+       [[ "$sel_argo" != "true" ]] && [[ "$sel_trojan" != "true" ]] && \
+       [[ "$sel_hy2" != "true" ]] && [[ "$sel_tuic" != "true" ]] && \
+       [[ "$sel_ss" != "true" ]]; then
+        red "请至少选择一个协议！"
+        return 1
+    fi
+    
+    echo
+    yellow "正在生成自定义订阅..."
+    
+    # 读取IP列表
+    if [ -f "$WORKDIR/all_ips.txt" ]; then
+        mapfile -t ALL_IPS < "$WORKDIR/all_ips.txt"
+    fi
+    IP_COUNT=${#ALL_IPS[@]}
+    
+    # 读取配置 - 优先从保存的文件读取
+    UUID=$(cat "$WORKDIR/UUID.txt" 2>/dev/null)
+    
+    # 端口读取 - 优先从保存文件，否则从 devil port list
+    if [ -f "$WORKDIR/ports.txt" ]; then
+        source "$WORKDIR/ports.txt"
+    else
+        # 实时读取端口
+        local port_list=$(devil port list 2>/dev/null)
+        VMESS_PORT=$(echo "$port_list" | awk '/tcp/ {print $1}' | sed -n '1p')
+        VLESS_PORT=$(echo "$port_list" | awk '/tcp/ {print $1}' | sed -n '2p')
+        HY2_PORT=$(echo "$port_list" | awk '/udp/ {print $1}' | sed -n '1p')
+        # Serv00 只有1个UDP端口, TUIC共用
+        TUIC_PORT=${HY2_PORT}
+    fi
+    
+    REALITY_DOMAIN=$(cat "$WORKDIR/reym.txt" 2>/dev/null)
+    REALITY_PUBLIC_KEY=$(cat "$WORKDIR/public_key.txt" 2>/dev/null)
+    ARGO_DOMAIN_FINAL=$(get_argo_domain)
+    SUB_TOKEN=$(cat "$WORKDIR/UUID.txt" 2>/dev/null | head -c 8)
+    
+    # ISP检测
+    ISP=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" 2>/dev/null | jq -r '.isp // "Unknown"' | sed 's/ /_/g')
+    NAME="${ISP}-${snb}"
+    
+    # 创建临时文件
+    local custom_links="$WORKDIR/custom_links.txt"
+    > "$custom_links"
+    local node_count=0
+    
+    # 根据选择生成链接
+    if [[ "$sel_vless" == "true" ]]; then
+        local idx=1
+        for ip in "${ALL_IPS[@]}"; do
+            vless_link="vless://$UUID@$ip:$VLESS_PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$REALITY_DOMAIN&fp=chrome&pbk=$REALITY_PUBLIC_KEY&type=tcp&headerType=none#$NAME-vless-$idx"
+            echo "$vless_link" >> "$custom_links"
+            ((idx++))
+            ((node_count++))
+        done
+        purple "✓ 已添加 VLESS-Reality 节点 (${IP_COUNT} 个)"
+    fi
+    
+    if [[ "$sel_vmess" == "true" ]]; then
+        local idx=1
+        for ip in "${ALL_IPS[@]}"; do
+            vmess_direct=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-vmess-$idx\", \"add\": \"$ip\", \"port\": \"$VMESS_PORT\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\", \"sni\": \"\"}" | base64 -w0)
+            echo "vmess://$vmess_direct" >> "$custom_links"
+            ((idx++))
+            ((node_count++))
+        done
+        purple "✓ 已添加 VMess-WS 直连节点 (${IP_COUNT} 个)"
+    fi
+    
+    if [[ "$sel_argo" == "true" ]] && [[ -n "$ARGO_DOMAIN_FINAL" ]]; then
+        CFIP=${CFIP:-'www.visa.com.hk'}
+        CFPORT=${CFPORT:-'443'}
+        
+        vmess_argo_tls=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-tls\", \"add\": \"$CFIP\", \"port\": \"$CFPORT\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\"}" | base64 -w0)
+        echo "vmess://$vmess_argo_tls" >> "$custom_links"
+        
+        vmess_argo=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo\", \"add\": \"$CFIP\", \"port\": \"8880\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
+        echo "vmess://$vmess_argo" >> "$custom_links"
+        ((node_count+=2))
+        
+        # CDN节点
+        for port in 443 2053 2083 2087 2096 8443; do
+            vmess_cdn=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-cdn-$port\", \"add\": \"104.16.0.0\", \"port\": \"$port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\"}" | base64 -w0)
+            echo "vmess://$vmess_cdn" >> "$custom_links"
+            ((node_count++))
+        done
+        
+        for port in 80 8080 8880 2052 2082 2086 2095; do
+            vmess_cdn=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-cdn-$port\", \"add\": \"104.17.0.0\", \"port\": \"$port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
+            echo "vmess://$vmess_cdn" >> "$custom_links"
+            ((node_count++))
+        done
+        purple "✓ 已添加 VMess-WS-Argo 节点 (含CDN节点)"
+    fi
+    
+    if [[ "$sel_trojan" == "true" ]]; then
+        local idx=1
+        for ip in "${ALL_IPS[@]}"; do
+            trojan_link="trojan://$UUID@$ip:$VMESS_PORT?security=tls&sni=${USERNAME}.${DOMAIN}&type=ws&path=/$UUID-tr#$NAME-trojan-$idx"
+            echo "$trojan_link" >> "$custom_links"
+            ((idx++))
+            ((node_count++))
+        done
+        purple "✓ 已添加 Trojan-WS 节点 (${IP_COUNT} 个)"
+    fi
+    
+    if [[ "$sel_hy2" == "true" ]]; then
+        local idx=1
+        for ip in "${ALL_IPS[@]}"; do
+            hy2_link="hysteria2://$UUID@$ip:$HY2_PORT?security=tls&sni=www.bing.com&alpn=h3&insecure=1#$NAME-hy2-$idx"
+            echo "$hy2_link" >> "$custom_links"
+            ((idx++))
+            ((node_count++))
+        done
+        purple "✓ 已添加 Hysteria2 节点 (${IP_COUNT} 个)"
+    fi
+    
+    if [[ "$sel_tuic" == "true" ]]; then
+        local idx=1
+        for ip in "${ALL_IPS[@]}"; do
+            tuic_link="tuic://$UUID:$UUID@$ip:$TUIC_PORT?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#$NAME-tuic-$idx"
+            echo "$tuic_link" >> "$custom_links"
+            ((idx++))
+            ((node_count++))
+        done
+        purple "✓ 已添加 TUIC v5 节点 (${IP_COUNT} 个)"
+    fi
+    
+    if [[ "$sel_ss" == "true" ]]; then
+        SS_PASSWORD=$(cat "$WORKDIR/ss_password.txt" 2>/dev/null)
+        local idx=1
+        for ip in "${ALL_IPS[@]}"; do
+            ss_link="ss://$(echo -n "2022-blake3-aes-128-gcm:$SS_PASSWORD" | base64 -w0)@$ip:$((VMESS_PORT+1))#$NAME-ss-$idx"
+            echo "$ss_link" >> "$custom_links"
+            ((idx++))
+            ((node_count++))
+        done
+        purple "✓ 已添加 Shadowsocks-2022 节点 (${IP_COUNT} 个)"
+    fi
+    
+    echo
+    green "=========================================="
+    green "自定义订阅已生成！"
+    green "节点总数: $node_count 个"
+    green "=========================================="
+    echo
+    
+    # 生成自定义订阅文件名 (基于选择的协议)
+    local sub_suffix="custom"
+    [[ "$sel_vless" == "true" ]] && sub_suffix="${sub_suffix}-vl"
+    [[ "$sel_vmess" == "true" ]] && sub_suffix="${sub_suffix}-vm"
+    [[ "$sel_argo" == "true" ]] && sub_suffix="${sub_suffix}-ar"
+    [[ "$sel_trojan" == "true" ]] && sub_suffix="${sub_suffix}-tr"
+    [[ "$sel_hy2" == "true" ]] && sub_suffix="${sub_suffix}-h2"
+    [[ "$sel_tuic" == "true" ]] && sub_suffix="${sub_suffix}-tu"
+    [[ "$sel_ss" == "true" ]] && sub_suffix="${sub_suffix}-ss"
+    
+    # 保存到公共目录
+    local custom_sub_file="${SUB_TOKEN}-${sub_suffix}.txt"
+    base64 -w0 "$custom_links" > "${FILE_PATH}/${custom_sub_file}"
+    
+    local custom_sub_link="https://${USERNAME}.${DOMAIN}/${custom_sub_file}"
+    
+    blue "自定义订阅链接:"
+    echo
+    green "$custom_sub_link"
+    echo
+    
+    # 询问是否复制链接或显示节点
+    yellow "选项:"
+    yellow "  1. 显示所有节点链接"
+    yellow "  2. 保存为主订阅链接 (覆盖原订阅)"
+    yellow "  0. 返回"
+    reading "请选择: " sub_action
+    
+    case "$sub_action" in
+        1)
+            echo
+            green "========== 节点链接 =========="
+            cat "$custom_links"
+            green "=============================="
+            ;;
+        2)
+            cp "$custom_links" "$WORKDIR/links.txt"
+            base64 -w0 "$custom_links" > "${FILE_PATH}/${SUB_TOKEN}.txt"
+            green "已保存为主订阅链接!"
+            green "订阅链接: https://${USERNAME}.${DOMAIN}/${SUB_TOKEN}.txt"
+            ;;
+    esac
 }
 
 # ==================== 快捷命令 ====================
@@ -1453,8 +2399,13 @@ install_nodes() {
         stop_all
     fi
     
-    # 初始化
+    # 初始化目录
     init_directories
+    
+    # 先选择协议 (Serv00需要先知道要几个端口)
+    select_protocols
+    
+    # 根据选择的协议分配端口
     check_port
     
     # 下载二进制文件
@@ -1468,10 +2419,26 @@ install_nodes() {
     generate_certificate
     generate_reality_keys
     
-    # 读取用户配置
+    # 读取用户配置 (IP选择、UUID等)
     read_user_config
-    select_protocols
     configure_argo
+    
+    # 保存协议配置 (用于后续修改)
+    echo "$ENABLE_ARGO" > "$WORKDIR/enable_argo.txt"
+    echo "$ENABLE_VLESS_REALITY" > "$WORKDIR/enable_vless.txt"
+    echo "$ENABLE_VMESS_WS" > "$WORKDIR/enable_vmess.txt"
+    echo "$ENABLE_TROJAN_WS" > "$WORKDIR/enable_trojan.txt"
+    echo "$ENABLE_HYSTERIA2" > "$WORKDIR/enable_hy2.txt"
+    echo "$ENABLE_TUIC" > "$WORKDIR/enable_tuic.txt"
+    echo "$ENABLE_SHADOWSOCKS" > "$WORKDIR/enable_ss.txt"
+    
+    # 保存端口配置 (用于后续自定义推送)
+    cat > "$WORKDIR/ports.txt" <<EOF
+VMESS_PORT=$VMESS_PORT
+VLESS_PORT=$VLESS_PORT
+HY2_PORT=$HY2_PORT
+TUIC_PORT=$TUIC_PORT
+EOF
     
     # 生成配置
     generate_singbox_config
@@ -1721,6 +2688,311 @@ view_logs_menu() {
     view_logs_menu
 }
 
+# 配置WARP出站 (安装后修改 - 保留现有节点)
+configure_warp_outbound() {
+    echo
+    green "==== 配置WARP出站 ===="
+    
+    if [ ! -f "$WORKDIR/config.json" ]; then
+        red "未检测到安装，请先安装节点"
+        return 1
+    fi
+    
+    cd "$WORKDIR"
+    
+    # 显示当前状态
+    local current_status=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null)
+    local current_mode=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null)
+    
+    echo
+    if [[ "$current_status" == "true" ]]; then
+        if [[ "$current_mode" == "all" ]]; then
+            blue "当前状态: WARP 已启用 (全部流量)"
+        else
+            blue "当前状态: WARP 已启用 (Google/YouTube分流)"
+        fi
+    else
+        yellow "当前状态: WARP 未启用 (直连)"
+    fi
+    
+    echo
+    yellow "选择新的配置:"
+    yellow "  0. 不使用 WARP (直连)"
+    yellow "  1. 全部流量走 WARP"
+    yellow "  2. 仅 Google/YouTube 走 WARP (分流)"
+    yellow "  9. 返回主菜单"
+    reading "请选择 0-2 (9返回): " new_choice
+    
+    if [[ "$new_choice" == "9" ]]; then
+        return 0
+    fi
+    
+    # 根据选择设置变量
+    case "$new_choice" in
+        1)
+            if init_warp_config; then
+                WARP_ENABLED=true
+                WARP_MODE="all"
+                echo "true" > "$WORKDIR/warp_enabled.txt"
+                echo "all" > "$WORKDIR/warp_mode.txt"
+                green "已选择: 全部流量通过 WARP"
+            else
+                red "WARP 配置获取失败"
+                return 1
+            fi
+            ;;
+        2)
+            if init_warp_config; then
+                WARP_ENABLED=true
+                WARP_MODE="google"
+                echo "true" > "$WORKDIR/warp_enabled.txt"
+                echo "google" > "$WORKDIR/warp_mode.txt"
+                green "已选择: Google/YouTube 通过 WARP"
+            else
+                red "WARP 配置获取失败"
+                return 1
+            fi
+            ;;
+        0)
+            WARP_ENABLED=false
+            WARP_MODE=""
+            echo "false" > "$WORKDIR/warp_enabled.txt"
+            echo "" > "$WORKDIR/warp_mode.txt"
+            green "已选择: 直连 (不使用 WARP)"
+            ;;
+        *)
+            red "无效选项"
+            return 1
+            ;;
+    esac
+    
+    echo
+    yellow "正在修改配置文件 (保留现有节点)..."
+    
+    # 备份原配置
+    cp config.json config.json.bak.$(date +%Y%m%d%H%M%S)
+    green "已备份原配置"
+    
+    # 获取 WARP 配置
+    local warp_endpoint=$(get_warp_endpoint)
+    local warp_ipv6="${WARP_IPV6:-2606:4700:110:8d8d:1845:c39f:2dd5:a03a}"
+    local warp_private_key="${WARP_PRIVATE_KEY:-52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A=}"
+    local warp_reserved="${WARP_RESERVED:-[215, 69, 233]}"
+    
+    # 提取 inbounds 部分 (保留不变)
+    # 使用 awk 提取从 "inbounds" 到 "]," 的内容
+    local inbounds_content=$(awk '
+        /"inbounds"/ { found=1 }
+        found { 
+            print
+            if (/^  \],?$/ && found) { found=0; exit }
+        }
+    ' config.json)
+    
+    # 提取 log 和 dns 部分
+    local log_content=$(awk '
+        /"log"/ { found=1 }
+        found { 
+            print
+            brace_count += gsub(/{/, "{")
+            brace_count -= gsub(/}/, "}")
+            if (brace_count == 0 && found) { found=0 }
+        }
+    ' config.json)
+    
+    local dns_content=$(awk '
+        /"dns"/ { found=1 }
+        found { 
+            print
+            brace_count += gsub(/{/, "{")
+            brace_count -= gsub(/}/, "}")
+            if (brace_count == 0 && found) { found=0 }
+        }
+    ' config.json)
+
+    # 生成新的 outbounds 和 route
+    local new_outbounds=""
+    local new_route=""
+    
+    if [[ "$WARP_ENABLED" == "true" ]] && [[ "$WARP_MODE" == "all" ]]; then
+        # 全部流量走 WARP
+        new_outbounds=$(cat <<WARP_ALL
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    },
+    {
+      "type": "wireguard",
+      "tag": "warp-out",
+      "server": "$warp_endpoint",
+      "server_port": 2408,
+      "local_address": [
+        "172.16.0.2/32",
+        "${warp_ipv6}/128"
+      ],
+      "private_key": "${warp_private_key}",
+      "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+      "reserved": ${warp_reserved}
+    }
+  ],
+  "route": {
+    "final": "warp-out"
+  }
+WARP_ALL
+)
+    elif [[ "$WARP_ENABLED" == "true" ]] && [[ "$WARP_MODE" == "google" ]]; then
+        # 分流模式
+        new_outbounds=$(cat <<WARP_SPLIT
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    },
+    {
+      "type": "wireguard",
+      "tag": "warp-out",
+      "server": "$warp_endpoint",
+      "server_port": 2408,
+      "local_address": [
+        "172.16.0.2/32",
+        "${warp_ipv6}/128"
+      ],
+      "private_key": "${warp_private_key}",
+      "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+      "reserved": ${warp_reserved}
+    }
+  ],
+  "route": {
+    "rule_set": [
+      {
+        "tag": "youtube",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs",
+        "download_detour": "direct"
+      },
+      {
+        "tag": "google",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/google.srs",
+        "download_detour": "direct"
+      },
+      {
+        "tag": "openai",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/openai.srs",
+        "download_detour": "direct"
+      },
+      {
+        "tag": "netflix",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs",
+        "download_detour": "direct"
+      }
+    ],
+    "rules": [
+      {
+        "rule_set": ["google", "youtube", "openai", "netflix"],
+        "outbound": "warp-out"
+      }
+    ],
+    "final": "direct"
+  }
+WARP_SPLIT
+)
+    else
+        # 直连
+        new_outbounds=$(cat <<DIRECT
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ]
+DIRECT
+)
+    fi
+
+    # 重新组装配置文件
+    cat > config.json <<CONFIG_EOF
+{
+$log_content
+$dns_content
+$inbounds_content
+$new_outbounds
+}
+CONFIG_EOF
+
+    # 验证配置
+    SB_BINARY=$(cat sb.txt 2>/dev/null)
+    if [ -n "$SB_BINARY" ] && [ -f "$SB_BINARY" ]; then
+        yellow "验证配置文件..."
+        config_check=$(./"$SB_BINARY" check -c config.json 2>&1)
+        if [ $? -ne 0 ]; then
+            red "配置验证失败:"
+            echo "$config_check" | head -10
+            yellow "正在恢复备份..."
+            mv config.json.bak.* config.json 2>/dev/null
+            return 1
+        fi
+        green "配置验证通过"
+    fi
+    
+    # 询问是否重启服务
+    echo
+    reading "是否立即重启服务使配置生效? [Y/n]: " restart_now
+    
+    if [[ ! "$restart_now" =~ ^[Nn]$ ]]; then
+        yellow "正在重启服务..."
+        
+        # 只重启 sing-box
+        pkill -f "run -c config.json" >/dev/null 2>&1
+        sleep 1
+        
+        nohup ./"$SB_BINARY" run -c config.json >> "$WORKDIR/singbox.log" 2>&1 &
+        sleep 2
+        
+        if pgrep -x "$SB_BINARY" > /dev/null; then
+            green "服务重启成功！"
+            
+            if [[ "$WARP_ENABLED" == "true" ]]; then
+                if [[ "$WARP_MODE" == "all" ]]; then
+                    blue "✓ WARP 出站已启用 (全部流量)"
+                else
+                    blue "✓ WARP 出站已启用 (Google/YouTube/Netflix/OpenAI)"
+                fi
+            else
+                green "✓ 已切换为直连出站"
+            fi
+        else
+            red "服务重启失败"
+            show_singbox_log
+            return 1
+        fi
+    else
+        yellow "配置已保存，请手动重启服务使其生效"
+        yellow "使用菜单选项 3 重启所有进程"
+    fi
+    
+    green "操作完成！现有节点配置未被改动"
+}
+
 # ==================== 菜单 ====================
 
 menu() {
@@ -1747,6 +3019,19 @@ menu() {
         else
             yellow "状态: ⚠ 已安装但未运行"
         fi
+        
+        # 显示WARP状态
+        local warp_status=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null)
+        local warp_mode=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null)
+        if [[ "$warp_status" == "true" ]]; then
+            if [[ "$warp_mode" == "all" ]]; then
+                blue "WARP: ✓ 已启用 (全部流量)"
+            else
+                blue "WARP: ✓ 已启用 (Google/YouTube)"
+            fi
+        else
+            purple "WARP: ✗ 未启用"
+        fi
     else
         yellow "状态: ✗ 未安装"
     fi
@@ -1763,16 +3048,20 @@ menu() {
     echo "------------------------------------------------------------"
     green "  5. 查看节点信息"
     echo "------------------------------------------------------------"
-    yellow "  6. 重置端口"
+    blue "  6. 自定义节点组合推送"
     echo "------------------------------------------------------------"
-    blue "  7. 查看运行日志"
+    yellow "  7. 重置端口"
     echo "------------------------------------------------------------"
-    red "  9. 系统初始化清理"
+    blue "  8. 查看运行日志"
+    echo "------------------------------------------------------------"
+    blue "  9. 配置WARP出站"
+    echo "------------------------------------------------------------"
+    red " 10. 系统初始化清理"
     echo "------------------------------------------------------------"
     red "  0. 退出"
     echo "============================================================"
     
-    reading "请选择 [0-9]: " choice
+    reading "请选择 [0-10]: " choice
     echo
     
     case "$choice" in
@@ -1781,9 +3070,11 @@ menu() {
         3) restart_processes ;;
         4) reset_argo ;;
         5) show_links ;;
-        6) reset_all_ports ;;
-        7) view_logs_menu ;;
-        9) 
+        6) custom_push_nodes ;;
+        7) reset_all_ports ;;
+        8) view_logs_menu ;;
+        9) configure_warp_outbound ;;
+        10) 
             reading "确定清理所有内容? (y/N): " confirm
             if [[ "$confirm" =~ ^[Yy]$ ]]; then
                 stop_all
