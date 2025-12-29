@@ -578,6 +578,15 @@ init_warp_config() {
 
 # 获取 WARP Endpoint 配置 (检测网络环境选择最佳 Endpoint)
 get_warp_endpoint() {
+    # 优先使用已保存的优选 Endpoint
+    if [ -f "$WORKDIR/warp_best_endpoint.txt" ]; then
+        local saved_endpoint=$(cat "$WORKDIR/warp_best_endpoint.txt" 2>/dev/null)
+        if [ -n "$saved_endpoint" ]; then
+            echo "$saved_endpoint"
+            return
+        fi
+    fi
+    
     local has_ipv4=false
     local has_ipv6=false
     
@@ -601,9 +610,194 @@ get_warp_endpoint() {
         # 纯 IPv6 环境
         echo "2606:4700:d0::a29f:c001"
     else
-        # IPv4 或双栈，使用优选 IP
+        # IPv4 或双栈，使用默认 IP
         echo "162.159.192.1"
     fi
+}
+
+# WARP Endpoint IP 优选
+# 使用 warp-endpoint-optimizer-main 项目进行优选
+optimize_warp_endpoint() {
+    local ipv6_mode="$1"  # 传入 6 则使用 IPv6 优选
+    
+    echo
+    green "==== WARP Endpoint IP 优选 ===="
+    echo
+    
+    # 检测服务器CPU架构
+    local arch=""
+    case "$(uname -m)" in
+        x86_64 | amd64 ) arch='amd64' ;;
+        armv8 | arm64 | aarch64 ) arch='arm64' ;;
+        * ) 
+            red "不支持的CPU架构: $(uname -m)"
+            return 1
+            ;;
+    esac
+    
+    # 检查是否需要关闭 WARP/sing-box 服务
+    local sb_binary=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
+    local warp_running=false
+    
+    if [ -n "$sb_binary" ] && pgrep -x "$sb_binary" >/dev/null 2>&1; then
+        local warp_status=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null)
+        if [[ "$warp_status" == "true" ]]; then
+            warp_running=true
+            yellow "检测到 WARP 正在运行，需要暂时关闭以进行优选..."
+            pkill -x "$sb_binary" >/dev/null 2>&1
+            sleep 2
+            green "已暂停 sing-box 服务"
+        fi
+    fi
+    
+    cd "$WORKDIR"
+    local result_file="result.csv"
+    local warp_tool="warp_optimizer"
+    
+    # 删除之前的优选结果文件
+    rm -f "$result_file"
+    
+    # 下载 WARP 优选工具
+    yellow "正在下载 WARP Endpoint 优选工具..."
+    
+    # 根据系统选择下载源
+    local os_type=$(uname -s | tr '[:upper:]' '[:lower:]')
+    local download_url=""
+    
+    if [[ "$os_type" == "freebsd" ]]; then
+        # FreeBSD 使用 darwin 版本 (兼容性较好)
+        download_url="https://gitlab.com/Misaka-blog/warp-script/-/raw/main/files/warp-yxip/warp-darwin-${arch}"
+    else
+        download_url="https://gitlab.com/Misaka-blog/warp-script/-/raw/main/files/warp-yxip/warp-darwin-${arch}"
+    fi
+    
+    if ! curl -sL "$download_url" -o "$warp_tool" 2>/dev/null && \
+       ! wget -qO "$warp_tool" "$download_url" 2>/dev/null; then
+        red "优选工具下载失败"
+        # 恢复服务
+        if $warp_running && [ -n "$sb_binary" ] && [ -f "$sb_binary" ]; then
+            nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
+            green "已恢复 sing-box 服务"
+        fi
+        return 1
+    fi
+    
+    chmod +x "$warp_tool"
+    
+    # 设置线程限制 (如果可用)
+    ulimit -n 102400 2>/dev/null || true
+    
+    # 运行优选
+    yellow "开始优选 Endpoint IP (这可能需要几分钟)..."
+    echo
+    
+    if [[ "$ipv6_mode" == "6" ]]; then
+        yellow "模式: IPv6 优选"
+        ./"$warp_tool" -ipv6 2>/dev/null || ./"$warp_tool" 2>/dev/null
+    else
+        yellow "模式: IPv4 优选"
+        ./"$warp_tool" 2>/dev/null
+    fi
+    
+    # 检查结果
+    if [ ! -f "$result_file" ]; then
+        red "优选失败，未生成结果文件"
+        rm -f "$warp_tool"
+        # 恢复服务
+        if $warp_running && [ -n "$sb_binary" ] && [ -f "$sb_binary" ]; then
+            nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
+            green "已恢复 sing-box 服务"
+        fi
+        return 1
+    fi
+    
+    # 显示优选结果
+    echo
+    green "优选结果 (前10个):" 
+    echo "----------------------------------------"
+    awk -F, 'NR>1 && $3!="timeout ms" {print} ' "$result_file" | sort -t, -nk2 -nk3 | uniq | head -10 | awk -F, '{print "Endpoint: "$1"  丢包率: "$2"  延迟: "$3}'
+    echo "----------------------------------------"
+    
+    # 获取最优 IP
+    local best_endpoint=$(awk -F, 'NR==2{print $1}' "$result_file")
+    
+    if [ -z "$best_endpoint" ]; then
+        red "无法获取最优 Endpoint"
+        rm -f "$warp_tool"
+        # 恢复服务
+        if $warp_running && [ -n "$sb_binary" ] && [ -f "$sb_binary" ]; then
+            nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
+            green "已恢复 sing-box 服务"
+        fi
+        return 1
+    fi
+    
+    # 只取IP部分（去掉端口）
+    local best_ip=$(echo "$best_endpoint" | cut -d':' -f1)
+    local best_port=$(echo "$best_endpoint" | cut -d':' -f2)
+    
+    # 如果没有端口，使用默认端口 2408
+    if [ -z "$best_port" ] || [ "$best_ip" == "$best_endpoint" ]; then
+        best_port="2408"
+        best_ip="$best_endpoint"
+    fi
+    
+    echo
+    green "最优 Endpoint: $best_ip:$best_port"
+    
+    # 保存优选结果
+    echo "$best_ip" > "$WORKDIR/warp_best_endpoint.txt"
+    echo "$best_port" > "$WORKDIR/warp_best_port.txt"
+    green "已保存优选结果到 warp_best_endpoint.txt"
+    
+    # 清理优选工具
+    rm -f "$warp_tool"
+    
+    # 如果配置文件存在，更新配置中的 endpoint
+    if [ -f "$WORKDIR/config.json" ]; then
+        echo
+        reading "是否立即更新配置文件中的 Endpoint? [Y/n]: " update_now
+        
+        if [[ ! "$update_now" =~ ^[Nn]$ ]]; then
+            # 备份配置
+            cp config.json config.json.bak.$(date +%Y%m%d%H%M%S)
+            
+            # 使用 sed 替换 endpoint
+            # 支持 IPv4 和 IPv6 格式
+            if command -v jq >/dev/null 2>&1; then
+                # 使用 jq 更新
+                local tmp_file=$(mktemp)
+                jq --arg ip "$best_ip" --argjson port "$best_port" '
+                    (.outbounds[] | select(.type == "wireguard") | .server) = $ip |
+                    (.outbounds[] | select(.type == "wireguard") | .server_port) = $port
+                ' config.json > "$tmp_file" && mv "$tmp_file" config.json
+                green "配置文件已更新 (使用 jq)"
+            else
+                # 使用 sed 替换 (简单匹配)
+                sed -i.tmp 's/"server": "[^"]*"/"server": "'"$best_ip"'"/g' config.json
+                sed -i.tmp 's/"server_port": [0-9]*/"server_port": '"$best_port"'/g' config.json
+                rm -f config.json.tmp
+                green "配置文件已更新 (使用 sed)"
+            fi
+        fi
+    fi
+    
+    # 恢复服务
+    if $warp_running && [ -n "$sb_binary" ] && [ -f "$sb_binary" ]; then
+        echo
+        yellow "正在恢复 sing-box 服务..."
+        nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
+        sleep 2
+        
+        if pgrep -x "$sb_binary" >/dev/null 2>&1; then
+            green "sing-box 服务已恢复运行"
+        else
+            red "sing-box 服务恢复失败，请检查日志"
+        fi
+    fi
+    
+    green "Endpoint 优选完成！"
+    return 0
 }
 
 # 询问是否启用 WARP 出站
@@ -624,6 +818,25 @@ ask_warp_outbound() {
                 WARP_ENABLED=true
                 WARP_MODE="all"
                 green "已启用 WARP 出站 (全部流量)"
+                
+                # 首次安装时自动运行 Endpoint 优选
+                echo
+                yellow "首次启用 WARP，建议进行 Endpoint 优选以获取最佳连接质量"
+                reading "是否现在运行 Endpoint 优选? [Y/n]: " run_optimize
+                
+                if [[ ! "$run_optimize" =~ ^[Nn]$ ]]; then
+                    echo
+                    yellow "选择优选模式:"
+                    yellow "  1. IPv4 优选 (默认)"
+                    yellow "  2. IPv6 优选"
+                    reading "请选择 [1-2]: " opt_mode
+                    
+                    if [[ "$opt_mode" == "2" ]]; then
+                        optimize_warp_endpoint 6
+                    else
+                        optimize_warp_endpoint
+                    fi
+                fi
             else
                 WARP_ENABLED=false
                 red "WARP 配置失败，将使用直连出站"
@@ -634,6 +847,25 @@ ask_warp_outbound() {
                 WARP_ENABLED=true
                 WARP_MODE="google"
                 green "已启用 WARP 出站 (仅 Google/YouTube)"
+                
+                # 首次安装时自动运行 Endpoint 优选
+                echo
+                yellow "首次启用 WARP，建议进行 Endpoint 优选以获取最佳连接质量"
+                reading "是否现在运行 Endpoint 优选? [Y/n]: " run_optimize
+                
+                if [[ ! "$run_optimize" =~ ^[Nn]$ ]]; then
+                    echo
+                    yellow "选择优选模式:"
+                    yellow "  1. IPv4 优选 (默认)"
+                    yellow "  2. IPv6 优选"
+                    reading "请选择 [1-2]: " opt_mode
+                    
+                    if [[ "$opt_mode" == "2" ]]; then
+                        optimize_warp_endpoint 6
+                    else
+                        optimize_warp_endpoint
+                    fi
+                fi
             else
                 WARP_ENABLED=false
                 red "WARP 配置失败，将使用直连出站"
@@ -1288,8 +1520,10 @@ EOF
   ],
 EOF
 
-    # 获取 WARP endpoint
+    # 获取 WARP endpoint (优先使用优选的)
     local warp_endpoint=$(get_warp_endpoint)
+    local warp_port=$(cat "$WORKDIR/warp_best_port.txt" 2>/dev/null)
+    warp_port=${warp_port:-2408}
     local warp_ipv6="${WARP_IPV6:-2606:4700:110:8d8d:1845:c39f:2dd5:a03a}"
     local warp_private_key="${WARP_PRIVATE_KEY:-52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A=}"
     local warp_reserved="${WARP_RESERVED:-[215, 69, 233]}"
@@ -1312,7 +1546,7 @@ EOF
       "type": "wireguard",
       "tag": "warp-out",
       "server": "$warp_endpoint",
-      "server_port": 2408,
+      "server_port": $warp_port,
       "local_address": [
         "172.16.0.2/32",
         "${warp_ipv6}/128"
@@ -1344,7 +1578,7 @@ EOF
       "type": "wireguard",
       "tag": "warp-out",
       "server": "$warp_endpoint",
-      "server_port": 2408,
+      "server_port": $warp_port,
       "local_address": [
         "172.16.0.2/32",
         "${warp_ipv6}/128"
@@ -2703,6 +2937,8 @@ configure_warp_outbound() {
     # 显示当前状态
     local current_status=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null)
     local current_mode=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null)
+    local current_endpoint=$(cat "$WORKDIR/warp_best_endpoint.txt" 2>/dev/null)
+    local current_port=$(cat "$WORKDIR/warp_best_port.txt" 2>/dev/null)
     
     echo
     if [[ "$current_status" == "true" ]]; then
@@ -2711,19 +2947,79 @@ configure_warp_outbound() {
         else
             blue "当前状态: WARP 已启用 (Google/YouTube分流)"
         fi
+        
+        # 显示当前 Endpoint
+        if [ -n "$current_endpoint" ]; then
+            green "当前 Endpoint: ${current_endpoint}:${current_port:-2408}"
+        else
+            yellow "当前 Endpoint: 默认 (未优选)"
+        fi
     else
         yellow "当前状态: WARP 未启用 (直连)"
     fi
     
     echo
-    yellow "选择新的配置:"
+    yellow "选择操作:"
     yellow "  0. 不使用 WARP (直连)"
     yellow "  1. 全部流量走 WARP"
     yellow "  2. 仅 Google/YouTube 走 WARP (分流)"
+    green "  3. 优选 Endpoint IP (优化连接质量)"
     yellow "  9. 返回主菜单"
-    reading "请选择 0-2 (9返回): " new_choice
+    reading "请选择 [0-3/9]: " new_choice
     
     if [[ "$new_choice" == "9" ]]; then
+        return 0
+    fi
+    
+    # 如果选择优选 Endpoint
+    if [[ "$new_choice" == "3" ]]; then
+        if [[ "$current_status" != "true" ]]; then
+            yellow "WARP 未启用，是否先启用 WARP?"
+            reading "选择模式 (1=全部流量, 2=分流, 其他=取消): " enable_mode
+            
+            case "$enable_mode" in
+                1)
+                    if init_warp_config; then
+                        WARP_ENABLED=true
+                        WARP_MODE="all"
+                        echo "true" > "$WORKDIR/warp_enabled.txt"
+                        echo "all" > "$WORKDIR/warp_mode.txt"
+                        green "已启用 WARP (全部流量)"
+                    else
+                        red "WARP 配置失败"
+                        return 1
+                    fi
+                    ;;
+                2)
+                    if init_warp_config; then
+                        WARP_ENABLED=true
+                        WARP_MODE="google"
+                        echo "true" > "$WORKDIR/warp_enabled.txt"
+                        echo "google" > "$WORKDIR/warp_mode.txt"
+                        green "已启用 WARP (分流模式)"
+                    else
+                        red "WARP 配置失败"
+                        return 1
+                    fi
+                    ;;
+                *)
+                    yellow "已取消"
+                    return 0
+                    ;;
+            esac
+        fi
+        
+        echo
+        yellow "选择优选模式:"
+        yellow "  1. IPv4 优选 (默认)"
+        yellow "  2. IPv6 优选"
+        reading "请选择 [1-2]: " opt_mode
+        
+        if [[ "$opt_mode" == "2" ]]; then
+            optimize_warp_endpoint 6
+        else
+            optimize_warp_endpoint
+        fi
         return 0
     fi
     
@@ -2775,6 +3071,8 @@ configure_warp_outbound() {
     
     # 获取 WARP 配置
     local warp_endpoint=$(get_warp_endpoint)
+    local warp_port=$(cat "$WORKDIR/warp_best_port.txt" 2>/dev/null)
+    warp_port=${warp_port:-2408}
     local warp_ipv6="${WARP_IPV6:-2606:4700:110:8d8d:1845:c39f:2dd5:a03a}"
     local warp_private_key="${WARP_PRIVATE_KEY:-52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A=}"
     local warp_reserved="${WARP_RESERVED:-[215, 69, 233]}"
@@ -2830,7 +3128,7 @@ configure_warp_outbound() {
       "type": "wireguard",
       "tag": "warp-out",
       "server": "$warp_endpoint",
-      "server_port": 2408,
+      "server_port": $warp_port,
       "local_address": [
         "172.16.0.2/32",
         "${warp_ipv6}/128"
@@ -2861,7 +3159,7 @@ WARP_ALL
       "type": "wireguard",
       "tag": "warp-out",
       "server": "$warp_endpoint",
-      "server_port": 2408,
+      "server_port": $warp_port,
       "local_address": [
         "172.16.0.2/32",
         "${warp_ipv6}/128"
