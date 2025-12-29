@@ -889,42 +889,33 @@ optimize_warp_endpoint() {
     echo "$best_port" > "$WORKDIR/warp_best_port.txt"
     green "已保存优选结果"
     
-    # 更新配置文件
+    # 更新配置文件并重启服务
     update_warp_config "$best_ip" "$best_port"
-    
-    # 恢复服务
-    if $warp_running && [ -n "$sb_binary" ] && [ -f "$sb_binary" ]; then
-        echo
-        yellow "正在恢复 sing-box 服务..."
-        nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
-        sleep 2
-        
-        if pgrep -x "$sb_binary" >/dev/null 2>&1; then
-            green "sing-box 服务已恢复运行"
-        else
-            red "sing-box 服务恢复失败，请检查日志"
-        fi
-    fi
     
     green "Endpoint 优选完成！"
     return 0
 }
 
 # 更新WARP配置文件中的Endpoint
+# 参数: $1=IP, $2=端口, $3=restart(可选，传入restart则自动重启)
 update_warp_config() {
     local new_ip="$1"
     local new_port="$2"
+    local auto_restart="$3"
     
     if [ ! -f "$WORKDIR/config.json" ]; then
         return 0
     fi
     
-    echo
-    reading "是否立即更新配置文件中的 Endpoint? [Y/n]: " update_now
-    
-    if [[ "$update_now" =~ ^[Nn]$ ]]; then
-        yellow "配置未更新，稍后可在菜单中手动更新"
-        return 0
+    # 如果不是自动重启模式，询问用户
+    if [[ "$auto_restart" != "restart" ]]; then
+        echo
+        reading "是否立即更新配置文件中的 Endpoint? [Y/n]: " update_now
+        
+        if [[ "$update_now" =~ ^[Nn]$ ]]; then
+            yellow "配置未更新，稍后可在菜单中手动更新"
+            return 0
+        fi
     fi
     
     cd "$WORKDIR"
@@ -960,6 +951,27 @@ update_warp_config() {
         sed -i '' 's/"server_port": [0-9]*/"server_port": '"$new_port"'/g' config.json 2>/dev/null || \
         sed -i 's/"server_port": [0-9]*/"server_port": '"$new_port"'/g' config.json
         green "配置文件已更新"
+    fi
+    
+    # 重启 sing-box 服务
+    local sb_binary=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
+    if [ -n "$sb_binary" ]; then
+        echo
+        yellow "正在重启 sing-box 服务..."
+        
+        # 停止现有服务
+        pkill -x "$sb_binary" >/dev/null 2>&1
+        sleep 1
+        
+        # 启动服务
+        nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
+        sleep 2
+        
+        if pgrep -x "$sb_binary" >/dev/null 2>&1; then
+            green "sing-box 服务重启成功"
+        else
+            red "sing-box 服务启动失败，请检查日志"
+        fi
     fi
 }
 
@@ -3126,11 +3138,76 @@ configure_warp_outbound() {
     yellow "  0. 不使用 WARP (直连)"
     yellow "  1. 全部流量走 WARP"
     yellow "  2. 仅 Google/YouTube 走 WARP (分流)"
+    echo "  -------------"
     green "  3. 优选 Endpoint IP (优化连接质量)"
+    blue "  4. 恢复 Cloudflare 默认 Endpoint"
+    blue "  5. 重新获取勇哥API配置"
+    echo "  -------------"
     yellow "  9. 返回主菜单"
-    reading "请选择 [0-3/9]: " new_choice
+    reading "请选择 [0-5/9]: " new_choice
     
     if [[ "$new_choice" == "9" ]]; then
+        return 0
+    fi
+    
+    # 恢复默认 Endpoint
+    if [[ "$new_choice" == "4" ]]; then
+        echo
+        yellow "将恢复 Cloudflare 默认 Endpoint..."
+        
+        # 检测网络环境选择默认endpoint
+        local default_endpoint="162.159.192.1"
+        local default_port="2408"
+        
+        # 检测是否纯IPv6
+        local has_ipv4=false
+        curl -s4m2 https://www.cloudflare.com/cdn-cgi/trace -k 2>/dev/null | grep -q "h=" && has_ipv4=true
+        
+        if [ "$has_ipv4" = false ]; then
+            default_endpoint="2606:4700:d0::a29f:c001"
+        fi
+        
+        # 清除优选结果
+        rm -f "$WORKDIR/warp_best_endpoint.txt"
+        rm -f "$WORKDIR/warp_best_port.txt"
+        rm -f "$WORKDIR/warp_result_history.txt"
+        
+        green "默认 Endpoint: $default_endpoint:$default_port"
+        
+        # 更新配置
+        update_warp_config "$default_endpoint" "$default_port" "restart"
+        
+        green "已恢复默认 Cloudflare Endpoint"
+        return 0
+    fi
+    
+    # 重新获取勇哥API配置
+    if [[ "$new_choice" == "5" ]]; then
+        echo
+        yellow "正在重新获取勇哥API配置..."
+        
+        if init_warp_config; then
+            green "WARP 配置已更新:"
+            green "  Private Key: ${WARP_PRIVATE_KEY:0:20}..."
+            green "  IPv6: $WARP_IPV6"
+            green "  Reserved: $WARP_RESERVED"
+            
+            # 重新生成配置
+            reading "是否重新生成配置文件? [Y/n]: " regen
+            if [[ ! "$regen" =~ ^[Nn]$ ]]; then
+                # 需要重新生成整个outbounds部分
+                yellow "正在更新配置文件..."
+                # 这里调用configure函数重新生成
+                local warp_endpoint=$(get_warp_endpoint)
+                local warp_port=$(cat "$WORKDIR/warp_best_port.txt" 2>/dev/null)
+                warp_port=${warp_port:-2408}
+                
+                update_warp_config "$warp_endpoint" "$warp_port" "restart"
+                green "配置已更新并重启服务"
+            fi
+        else
+            red "获取勇哥API配置失败"
+        fi
         return 0
     fi
     
