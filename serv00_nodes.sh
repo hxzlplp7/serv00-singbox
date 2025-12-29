@@ -620,9 +620,83 @@ get_warp_endpoint() {
 optimize_warp_endpoint() {
     local ipv6_mode="$1"  # 传入 6 则使用 IPv6 优选
     
+    cd "$WORKDIR"
+    
     echo
-    green "==== WARP Endpoint IP 优选 (Shell版) ===="
+    green "==== WARP Endpoint IP 优选 ===="
     echo
+    
+    # 检查是否有上次的优选结果
+    local last_result_file="$WORKDIR/warp_result_history.txt"
+    local current_endpoint=$(cat "$WORKDIR/warp_best_endpoint.txt" 2>/dev/null)
+    local current_port=$(cat "$WORKDIR/warp_best_port.txt" 2>/dev/null)
+    
+    if [ -n "$current_endpoint" ]; then
+        blue "当前使用的 Endpoint: ${current_endpoint}:${current_port:-2408}"
+    else
+        yellow "当前状态: 未选择优选 Endpoint (使用默认)"
+    fi
+    
+    # 如果有历史记录，显示选项
+    if [ -f "$last_result_file" ] && [ -s "$last_result_file" ]; then
+        echo
+        blue "检测到上次优选结果:"
+        echo "----------------------------------------"
+        local idx=1
+        tail -n +2 "$last_result_file" | \
+            awk -F, '$2 < 100' | \
+            sort -t, -k2,2n -k3,3n | \
+            head -10 | \
+            while IFS=, read -r endpoint loss delay; do
+                printf "  %2d. %-22s 丢包:%s%% 延迟:%sms\n" "$idx" "$endpoint" "$loss" "$delay"
+                idx=$((idx + 1))
+            done
+        echo "----------------------------------------"
+        echo
+        yellow "选项:"
+        yellow "  1-10. 选择上次结果中的 Endpoint"
+        yellow "  n. 进行新的优选测试"
+        yellow "  0. 返回不修改"
+        reading "请选择: " history_choice
+        
+        case "$history_choice" in
+            [1-9]|10)
+                # 从历史中选择
+                local selected_line=$(tail -n +2 "$last_result_file" | \
+                    awk -F, '$2 < 100' | \
+                    sort -t, -k2,2n -k3,3n | \
+                    sed -n "${history_choice}p")
+                
+                if [ -n "$selected_line" ]; then
+                    local sel_endpoint=$(echo "$selected_line" | cut -d, -f1)
+                    local sel_ip=$(echo "$sel_endpoint" | cut -d: -f1)
+                    local sel_port=$(echo "$sel_endpoint" | cut -d: -f2)
+                    
+                    echo "$sel_ip" > "$WORKDIR/warp_best_endpoint.txt"
+                    echo "$sel_port" > "$WORKDIR/warp_best_port.txt"
+                    green "已选择 Endpoint: $sel_ip:$sel_port"
+                    
+                    # 更新配置文件
+                    update_warp_config "$sel_ip" "$sel_port"
+                    return 0
+                else
+                    red "无效选择"
+                    return 1
+                fi
+                ;;
+            n|N)
+                # 继续进行新的优选
+                ;;
+            0|"")
+                yellow "已取消"
+                return 0
+                ;;
+            *)
+                red "无效选择"
+                return 1
+                ;;
+        esac
+    fi
     
     # 检查依赖
     if ! command -v nc >/dev/null 2>&1; then
@@ -645,8 +719,7 @@ optimize_warp_endpoint() {
         fi
     fi
     
-    cd "$WORKDIR"
-    local result_file="warp_result.txt"
+    local result_file="$WORKDIR/warp_result.txt"
     
     # 清理之前的结果
     rm -f "$result_file"
@@ -654,20 +727,14 @@ optimize_warp_endpoint() {
     # WARP 端口列表 (官方端口)
     local ports=(500 1701 2408 4500)
     
-    # WARP 握手数据包 (从PHP项目获取的hex数据)
-    # 这是WARP客户端发送的第一个UDP握手包
-    local warp_packet="048792cd9d8631f11f226c0df5225e23979601980529b028988f00a99bdb073737000000000000000000000000baba1a1346e1b2fe7cd524fa23163746"
-    
     # 生成测试IP列表
+    echo
     yellow "正在生成测试IP列表..."
     
     local test_ips=()
-    local cidr_base=""
     
     if [[ "$ipv6_mode" == "6" ]]; then
         yellow "模式: IPv6 优选"
-        # IPv6 CIDR: 2606:4700:d0::/48, 2606:4700:d1::/48
-        # 简化处理: 使用已知的几个IPv6地址
         test_ips=(
             "2606:4700:d0::a29f:c001"
             "2606:4700:d0::a29f:c002"
@@ -677,11 +744,9 @@ optimize_warp_endpoint() {
         )
     else
         yellow "模式: IPv4 优选"
-        # 从 162.159.192.0/24 和 162.159.193.0/24 生成随机IP
         local cidrs=("162.159.192" "162.159.193" "162.159.195" "188.114.96" "188.114.97")
         
         for cidr in "${cidrs[@]}"; do
-            # 每个网段生成10个随机IP
             for i in $(seq 1 10); do
                 local last_octet=$((RANDOM % 254 + 1))
                 test_ips+=("${cidr}.${last_octet}")
@@ -693,15 +758,15 @@ optimize_warp_endpoint() {
     green "共生成 $total_ips 个测试IP"
     echo
     
-    yellow "开始测试 Endpoint 延迟 (每个IP测试3次)..."
-    yellow "这可能需要几分钟，请耐心等待..."
+    yellow "开始测试 Endpoint 延迟..."
+    yellow "这可能需要1-2分钟，请耐心等待..."
     echo
     
     # 进度显示
     local tested=0
     local success=0
     
-    # 创建结果文件 (CSV格式: IP:Port, 丢包率, 平均延迟ms)
+    # 创建结果文件
     echo "endpoint,loss,delay" > "$result_file"
     
     for ip in "${test_ips[@]}"; do
@@ -710,54 +775,21 @@ optimize_warp_endpoint() {
         
         local total_time=0
         local recv_count=0
-        local send_count=3  # 每个IP发送3个包
+        local send_count=3
         
         for i in $(seq 1 $send_count); do
-            # 使用 nc 发送UDP包并测量时间
-            # FreeBSD/Linux 兼容的方式
-            local start_time=$(date +%s%N 2>/dev/null || echo "0")
+            local start_time=$(date +%s)
             
-            # 如果不支持纳秒，使用秒
-            if [ "$start_time" = "0" ]; then
-                start_time=$(date +%s)
-                
-                # 发送数据包并等待响应 (超时0.5秒)
-                echo -n "$warp_packet" | xxd -r -p 2>/dev/null | \
-                    timeout 0.5 nc -u -w 1 "$ip" "$port" >/dev/null 2>&1 && recv_count=$((recv_count + 1))
-                
-                local end_time=$(date +%s)
-                local elapsed=$((end_time - start_time))
-                total_time=$((total_time + elapsed * 1000))  # 转换为毫秒
-            else
-                # 发送数据包并等待响应
-                # 尝试多种方式
-                local resp=""
-                
-                if command -v xxd >/dev/null 2>&1; then
-                    # 使用 xxd 转换 hex 到二进制
-                    resp=$(echo -n "$warp_packet" | xxd -r -p 2>/dev/null | \
-                        timeout 0.5 nc -u -w 1 "$ip" "$port" 2>/dev/null | head -c 10)
-                elif command -v printf >/dev/null 2>&1; then
-                    # 备用方法
-                    resp=$(printf '%s' "$warp_packet" | \
-                        timeout 0.5 nc -u -w 1 "$ip" "$port" 2>/dev/null | head -c 10)
-                fi
-                
-                local end_time=$(date +%s%N 2>/dev/null || date +%s)
-                
-                if [ -n "$resp" ]; then
-                    recv_count=$((recv_count + 1))
-                fi
-                
-                # 计算延迟 (纳秒转毫秒)
-                if [ ${#start_time} -gt 10 ]; then
-                    local elapsed=$(( (end_time - start_time) / 1000000 ))
-                else
-                    local elapsed=$((end_time - start_time))
-                    elapsed=$((elapsed * 1000))
-                fi
-                total_time=$((total_time + elapsed))
+            # 使用 nc 测试连接 (不捕获响应内容，避免null byte警告)
+            # -z 只扫描，不发送数据 (用于快速测试端口可达性)
+            # 或使用 -w 1 设置超时
+            if echo "" | timeout 1 nc -u -w 1 "$ip" "$port" >/dev/null 2>&1; then
+                recv_count=$((recv_count + 1))
             fi
+            
+            local end_time=$(date +%s)
+            local elapsed=$((end_time - start_time))
+            total_time=$((total_time + elapsed * 1000))
         done
         
         # 计算丢包率和平均延迟
@@ -774,50 +806,21 @@ optimize_warp_endpoint() {
         echo "${ip}:${port},${loss},${delay}" >> "$result_file"
         
         tested=$((tested + 1))
-        # 简化进度显示
         if [ $((tested % 10)) -eq 0 ]; then
-            printf "\r已测试: %d/%d, 成功: %d" "$tested" "$total_ips" "$success"
+            printf "\r进度: %d/%d (成功: %d)   " "$tested" "$total_ips" "$success"
         fi
     done
     
+    printf "\r进度: %d/%d (成功: %d)   \n" "$tested" "$total_ips" "$success"
     echo
-    echo
+    
+    # 保存为历史记录
+    cp "$result_file" "$last_result_file"
     
     # 检查是否有结果
-    local result_count=$(wc -l < "$result_file" 2>/dev/null)
-    if [ "$result_count" -le 1 ]; then
-        red "优选失败，无有效结果"
-        # 恢复服务
-        if $warp_running && [ -n "$sb_binary" ] && [ -f "$sb_binary" ]; then
-            nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
-            green "已恢复 sing-box 服务"
-        fi
-        return 1
-    fi
-    
-    # 按丢包率和延迟排序，显示前10个结果
-    echo
-    green "优选结果 (按丢包率和延迟排序，前10个):"
-    echo "=========================================="
-    printf "%-25s %-10s %-10s\n" "Endpoint" "丢包率%" "延迟ms"
-    echo "------------------------------------------"
-    
-    # 跳过表头，排序，显示前10个
-    tail -n +2 "$result_file" | \
-        awk -F, '$2 < 100 {print}' | \
-        sort -t, -k2,2n -k3,3n | \
-        head -10 | \
-        while IFS=, read -r endpoint loss delay; do
-            printf "%-25s %-10s %-10s\n" "$endpoint" "$loss" "$delay"
-        done
-    
-    echo "=========================================="
-    
-    # 获取最优 Endpoint
-    local best_line=$(tail -n +2 "$result_file" | awk -F, '$2 < 100' | sort -t, -k2,2n -k3,3n | head -1)
-    
-    if [ -z "$best_line" ]; then
-        red "无法找到可用的 Endpoint (全部超时)"
+    local valid_count=$(tail -n +2 "$result_file" | awk -F, '$2 < 100' | wc -l)
+    if [ "$valid_count" -eq 0 ]; then
+        red "优选失败，无可用 Endpoint"
         yellow "可能原因: 网络不通或防火墙阻止UDP"
         # 恢复服务
         if $warp_running && [ -n "$sb_binary" ] && [ -f "$sb_binary" ]; then
@@ -827,14 +830,58 @@ optimize_warp_endpoint() {
         return 1
     fi
     
-    local best_endpoint=$(echo "$best_line" | cut -d, -f1)
+    # 显示排序后的结果
+    echo
+    green "优选结果 (按延迟排序):"
+    echo "=============================================="
+    printf "  %-4s %-22s %-8s %-8s\n" "序号" "Endpoint" "丢包%" "延迟ms"
+    echo "----------------------------------------------"
+    
+    # 提取并排序，带序号显示
+    local idx=1
+    tail -n +2 "$result_file" | \
+        awk -F, '$2 < 100' | \
+        sort -t, -k2,2n -k3,3n | \
+        head -10 | \
+        while IFS=, read -r endpoint loss delay; do
+            printf "  %-4s %-22s %-8s %-8s\n" "[$idx]" "$endpoint" "$loss" "$delay"
+            idx=$((idx + 1))
+        done
+    
+    echo "=============================================="
+    echo
+    
+    # 让用户选择
+    yellow "请选择要使用的 Endpoint (输入序号 1-10，回车使用第1个):"
+    reading "选择: " user_choice
+    
+    if [ -z "$user_choice" ]; then
+        user_choice=1
+    fi
+    
+    # 验证输入
+    if ! [[ "$user_choice" =~ ^[0-9]+$ ]] || [ "$user_choice" -lt 1 ] || [ "$user_choice" -gt 10 ]; then
+        user_choice=1
+    fi
+    
+    # 获取用户选择的 Endpoint
+    local selected_line=$(tail -n +2 "$result_file" | \
+        awk -F, '$2 < 100' | \
+        sort -t, -k2,2n -k3,3n | \
+        sed -n "${user_choice}p")
+    
+    if [ -z "$selected_line" ]; then
+        selected_line=$(tail -n +2 "$result_file" | awk -F, '$2 < 100' | sort -t, -k2,2n -k3,3n | head -1)
+    fi
+    
+    local best_endpoint=$(echo "$selected_line" | cut -d, -f1)
     local best_ip=$(echo "$best_endpoint" | cut -d: -f1)
     local best_port=$(echo "$best_endpoint" | cut -d: -f2)
-    local best_loss=$(echo "$best_line" | cut -d, -f2)
-    local best_delay=$(echo "$best_line" | cut -d, -f3)
+    local best_loss=$(echo "$selected_line" | cut -d, -f2)
+    local best_delay=$(echo "$selected_line" | cut -d, -f3)
     
     echo
-    green "★ 最优 Endpoint: $best_ip:$best_port"
+    green "★ 已选择 Endpoint: $best_ip:$best_port"
     green "  丢包率: ${best_loss}%, 延迟: ${best_delay}ms"
     
     # 保存优选结果
@@ -842,33 +889,8 @@ optimize_warp_endpoint() {
     echo "$best_port" > "$WORKDIR/warp_best_port.txt"
     green "已保存优选结果"
     
-    # 如果配置文件存在，更新配置中的 endpoint
-    if [ -f "$WORKDIR/config.json" ]; then
-        echo
-        reading "是否立即更新配置文件中的 Endpoint? [Y/n]: " update_now
-        
-        if [[ ! "$update_now" =~ ^[Nn]$ ]]; then
-            # 备份配置
-            cp config.json config.json.bak.$(date +%Y%m%d%H%M%S)
-            
-            # 使用 sed 替换 endpoint
-            if command -v jq >/dev/null 2>&1; then
-                # 使用 jq 更新
-                local tmp_file=$(mktemp)
-                jq --arg ip "$best_ip" --argjson port "$best_port" '
-                    (.outbounds[] | select(.type == "wireguard") | .server) = $ip |
-                    (.outbounds[] | select(.type == "wireguard") | .server_port) = $port
-                ' config.json > "$tmp_file" && mv "$tmp_file" config.json
-                green "配置文件已更新 (使用 jq)"
-            else
-                # 使用 sed 替换
-                sed -i.tmp 's/"server": "[^"]*"/"server": "'"$best_ip"'"/g' config.json
-                sed -i.tmp 's/"server_port": [0-9]*/"server_port": '"$best_port"'/g' config.json
-                rm -f config.json.tmp
-                green "配置文件已更新 (使用 sed)"
-            fi
-        fi
-    fi
+    # 更新配置文件
+    update_warp_config "$best_ip" "$best_port"
     
     # 恢复服务
     if $warp_running && [ -n "$sb_binary" ] && [ -f "$sb_binary" ]; then
@@ -886,6 +908,59 @@ optimize_warp_endpoint() {
     
     green "Endpoint 优选完成！"
     return 0
+}
+
+# 更新WARP配置文件中的Endpoint
+update_warp_config() {
+    local new_ip="$1"
+    local new_port="$2"
+    
+    if [ ! -f "$WORKDIR/config.json" ]; then
+        return 0
+    fi
+    
+    echo
+    reading "是否立即更新配置文件中的 Endpoint? [Y/n]: " update_now
+    
+    if [[ "$update_now" =~ ^[Nn]$ ]]; then
+        yellow "配置未更新，稍后可在菜单中手动更新"
+        return 0
+    fi
+    
+    cd "$WORKDIR"
+    
+    # 备份配置
+    cp config.json config.json.bak.$(date +%Y%m%d%H%M%S) 2>/dev/null
+    
+    if command -v jq >/dev/null 2>&1; then
+        # 使用 jq 更新
+        local tmp_file=$(mktemp)
+        jq --arg ip "$new_ip" --argjson port "$new_port" '
+            (.outbounds[] | select(.type == "wireguard") | .server) = $ip |
+            (.outbounds[] | select(.type == "wireguard") | .server_port) = $port
+        ' config.json > "$tmp_file" 2>/dev/null
+        
+        if [ -s "$tmp_file" ]; then
+            cat "$tmp_file" > config.json
+            rm -f "$tmp_file"
+            green "配置文件已更新"
+        else
+            rm -f "$tmp_file"
+            yellow "jq更新失败，尝试sed..."
+            sed -i '' 's/"server": "[^"]*"/"server": "'"$new_ip"'"/g' config.json 2>/dev/null || \
+            sed -i 's/"server": "[^"]*"/"server": "'"$new_ip"'"/g' config.json
+            sed -i '' 's/"server_port": [0-9]*/"server_port": '"$new_port"'/g' config.json 2>/dev/null || \
+            sed -i 's/"server_port": [0-9]*/"server_port": '"$new_port"'/g' config.json
+            green "配置文件已更新 (sed)"
+        fi
+    else
+        # 使用 sed 替换 (兼容 BSD/GNU)
+        sed -i '' 's/"server": "[^"]*"/"server": "'"$new_ip"'"/g' config.json 2>/dev/null || \
+        sed -i 's/"server": "[^"]*"/"server": "'"$new_ip"'"/g' config.json
+        sed -i '' 's/"server_port": [0-9]*/"server_port": '"$new_port"'/g' config.json 2>/dev/null || \
+        sed -i 's/"server_port": [0-9]*/"server_port": '"$new_port"'/g' config.json
+        green "配置文件已更新"
+    fi
 }
 
 # 询问是否启用 WARP 出站
