@@ -1215,7 +1215,75 @@ EOF
     green "[+] Psiphon 配置已生成"
 }
 
-# 启动 Psiphon (nohup 版本)
+# 等待 Psiphon 就绪 (基于 notice 事件检测)
+psiphon_wait_ready() {
+    local log="$WORKDIR/psiphon.log"
+    local socks_port
+    socks_port="$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null)"
+    socks_port="${socks_port:-2080}"
+
+    # FreeBSD 共享机冷启动可能需要较长时间，等待 60 秒
+    local timeout=60
+    local elapsed=0
+    
+    yellow "[*] 等待 Psiphon 就绪 (最多 ${timeout} 秒)..."
+
+    while (( elapsed < timeout )); do
+        # 1) 检查端口占用 notice
+        if tail -n 200 "$log" 2>/dev/null | grep -q '"noticeType":"SocksProxyPortInUse"'; then
+            red "[!] Psiphon SOCKS 端口被占用：$socks_port"
+            yellow "    建议修改端口: echo 新端口 > $WORKDIR/psiphon_socks_port.txt"
+            return 2
+        fi
+
+        # 2) 检查已开始监听 notice (最可靠的就绪信号)
+        if tail -n 400 "$log" 2>/dev/null | grep -q '"noticeType":"ListeningSocksProxyPort"'; then
+            green "[+] Psiphon SOCKS 端口已监听"
+            return 0
+        fi
+
+        # 3) 检查 Tunnels notice (已建立隧道)
+        if tail -n 400 "$log" 2>/dev/null | grep -q '"noticeType":"Tunnels"'; then
+            if tail -n 400 "$log" 2>/dev/null | grep '"noticeType":"Tunnels"' | grep -q '"count":[1-9]'; then
+                green "[+] Psiphon 隧道已建立"
+                return 0
+            fi
+        fi
+
+        # 4) 兜底：检查本地端口是否监听 (FreeBSD 用 sockstat)
+        if command -v sockstat >/dev/null 2>&1; then
+            if sockstat -4l 2>/dev/null | grep -q ":${socks_port} "; then
+                green "[+] Psiphon SOCKS 端口已监听 (sockstat)"
+                return 0
+            fi
+        else
+            if netstat -an 2>/dev/null | grep -q "\.${socks_port} .*LISTEN"; then
+                green "[+] Psiphon SOCKS 端口已监听 (netstat)"
+                return 0
+            fi
+        fi
+
+        # 5) 检查进程是否还活着
+        if ! pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1; then
+            red "[!] Psiphon 进程已退出"
+            tail -15 "$log" 2>/dev/null
+            return 1
+        fi
+
+        sleep 3
+        elapsed=$((elapsed + 3))
+        printf "\r[*] 等待 Psiphon 就绪... %ds/%ds" "$elapsed" "$timeout"
+    done
+
+    echo
+    yellow "[!] 等待 Psiphon 就绪超时 (${timeout}s)"
+    yellow "    日志里没看到 ListeningSocksProxyPort，但进程可能仍在运行"
+    yellow "    建议稍后使用菜单 11 检测出口 IP"
+    # 不返回 1，因为可能只是检测不到 notice 但实际已就绪
+    return 0
+}
+
+# 启动 Psiphon (nohup 版本，带 notice 就绪检测)
 start_psiphon_userland() {
     local bin="$WORKDIR/psiphon-tunnel-core"
     
@@ -1230,6 +1298,9 @@ start_psiphon_userland() {
     # 先停止旧进程
     stop_psiphon_userland
 
+    # 清空旧日志 (便于检测新 notice)
+    > "$WORKDIR/psiphon.log" 2>/dev/null
+
     local socks_port=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null)
     socks_port="${socks_port:-2080}"
     
@@ -1237,17 +1308,27 @@ start_psiphon_userland() {
     cd "$WORKDIR"
     nohup "$bin" -config "$WORKDIR/psiphon.config" >>"$WORKDIR/psiphon.log" 2>&1 &
     
-    # 等待启动
-    sleep 3
-    
-    if pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1; then
-        green "[+] Psiphon 启动成功"
-        return 0
-    else
-        red "[!] Psiphon 启动失败，请检查日志: $WORKDIR/psiphon.log"
+    # 给进程一点启动时间
+    sleep 2
+
+    # 检查进程是否启动
+    if ! pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1; then
+        red "[!] Psiphon 进程启动失败"
         tail -20 "$WORKDIR/psiphon.log" 2>/dev/null
         return 1
     fi
+
+    # 等待就绪 (基于 notice 检测)
+    psiphon_wait_ready
+    local ready_status=$?
+    
+    if [[ $ready_status -eq 2 ]]; then
+        # 端口被占用
+        return 1
+    fi
+
+    green "[+] Psiphon 已启动"
+    return 0
 }
 
 # 停止 Psiphon
@@ -1496,17 +1577,31 @@ psiphon_egress_test() {
     fi
 
     local json
-    # 尝试 ipinfo.io
+    # 尝试 ipinfo.io (可能限流/403)
     json="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" https://ipinfo.io/json 2>/dev/null || true)"
     
-    # fallback 到 ip-api.com
+    # fallback 到 ip-api.com (免费无 key，但只有 HTTP)
     if [[ -z "$json" ]]; then
-        yellow "[*] ipinfo.io 失败，尝试 ip-api.com..."
+        yellow "[*] ipinfo.io 无响应，尝试 ip-api.com..."
         json="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" http://ip-api.com/json 2>/dev/null || true)"
+    fi
+    
+    # fallback 到 ifconfig.me (只返回 IP)
+    if [[ -z "$json" ]]; then
+        yellow "[*] ip-api.com 无响应，尝试 ifconfig.me..."
+        local raw_ip
+        raw_ip="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" https://ifconfig.me 2>/dev/null || true)"
+        if [[ -n "$raw_ip" ]]; then
+            green "  IP: $raw_ip"
+            yellow "  (其他信息无法获取，但 SOCKS 隧道正常)"
+            return 0
+        fi
     fi
 
     if [[ -z "$json" ]]; then
-        red "[!] FAIL: SOCKS 不通 (127.0.0.1:${socks})"
+        yellow "[!] 出口 IP 检测未成功"
+        yellow "    这不一定表示 Psiphon 未工作，可能是检测接口被墙/限流"
+        yellow "    建议稍后重试，或手动测试: curl --socks5-hostname 127.0.0.1:${socks} https://ipinfo.io/ip"
         return 1
     fi
 
