@@ -1190,7 +1190,7 @@ install_psiphon_userland() {
 
 # 生成 Psiphon 配置文件
 write_psiphon_config() {
-    local socks http region
+    local socks http region datadir
     socks="$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null)"
     http="$(cat "$WORKDIR/psiphon_http_port.txt" 2>/dev/null)"
     region="$(cat "$WORKDIR/psiphon_region.txt" 2>/dev/null)"
@@ -1198,12 +1198,25 @@ write_psiphon_config() {
     socks="${socks:-2080}"
     http="${http:-2081}"
     region="${region:-US}"
+    
+    # AUTO 时写空字符串
+    [[ "${region^^}" == "AUTO" ]] && region=""
+    
+    # 创建数据目录 (关键！否则可能因权限问题秒退)
+    datadir="$WORKDIR/psiphon-data"
+    mkdir -p "$datadir" 2>/dev/null
 
     cat > "$WORKDIR/psiphon.config" <<EOF
 {
+  "DataRootDirectory": "${datadir}",
+  "EmitDiagnosticNotices": true,
+  "EmitDiagnosticNetworkParameters": true,
+  "EmitServerAlerts": true,
+  
   "LocalHttpProxyPort": ${http},
   "LocalSocksProxyPort": ${socks},
   "EgressRegion": "${region}",
+  
   "PropagationChannelId": "FFFFFFFFFFFFFFFF",
   "SponsorId": "FFFFFFFFFFFFFFFF",
   "RemoteServerListDownloadFilename": "${WORKDIR}/remote_server_list",
@@ -1212,7 +1225,7 @@ write_psiphon_config() {
   "UseIndistinguishableTLS": true
 }
 EOF
-    green "[+] Psiphon 配置已生成"
+    green "[+] Psiphon 配置已生成 (数据目录: $datadir)"
 }
 
 # 等待 Psiphon 就绪 (基于 notice 事件检测)
@@ -1310,11 +1323,18 @@ start_psiphon_userland() {
     
     # 给进程一点启动时间
     sleep 2
+    local pid=$!
 
-    # 检查进程是否启动
-    if ! pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1; then
-        red "[!] Psiphon 进程启动失败"
-        tail -20 "$WORKDIR/psiphon.log" 2>/dev/null
+    # 检查进程是否启动 (如果秒退，用前台模式抓错误)
+    if ! kill -0 "$pid" 2>/dev/null && ! pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1; then
+        red "[!] Psiphon 秒退，正在抓取前台错误信息..."
+        echo
+        yellow "========== 前台错误输出 (最重要) =========="
+        timeout 10 "$bin" -config "$WORKDIR/psiphon.config" 2>&1 | head -n 60 || true
+        echo
+        yellow "========== 日志文件最后 30 行 =========="
+        tail -30 "$WORKDIR/psiphon.log" 2>/dev/null || true
+        echo "==========================================="
         return 1
     fi
 
