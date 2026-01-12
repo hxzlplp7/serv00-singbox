@@ -1361,6 +1361,7 @@ start_psiphon_userland() {
     cd "$WORKDIR"
     nohup "$bin" -config "$WORKDIR/psiphon.config" >>"$WORKDIR/psiphon.log" 2>&1 &
     local pid=$!
+    echo "$pid" > "$WORKDIR/psiphon.pid"
     
     # 给进程一点启动时间
     sleep 2
@@ -1434,6 +1435,84 @@ start_singbox_safe() {
         tail -20 "$WORKDIR/singbox.log" 2>/dev/null
         return 1
     fi
+}
+
+# 同步 Psiphon 端口到 sing-box 配置 (切换国家后必须调用)
+sync_psiphon_port_to_singbox() {
+    # 只在 Psiphon 已启用时才同步
+    local psi_enabled
+    psi_enabled="$(cat "$WORKDIR/psiphon_enabled.txt" 2>/dev/null || echo "false")"
+    [[ "$psi_enabled" == "true" ]] || {
+        # Psiphon 未启用，无需同步
+        return 0
+    }
+    
+    local port cfg psiphon_tag="psiphon-out"
+    port="$(get_psiphon_socks_port)"
+    cfg="$WORKDIR/config.json"
+    
+    if [[ "$port" == "0" || -z "$port" ]]; then
+        red "[!] 无法获取 Psiphon 实际端口，跳过同步"
+        return 1
+    fi
+    
+    if [[ ! -f "$cfg" ]]; then
+        # 配置文件不存在，可能尚未安装
+        return 0
+    fi
+    
+    yellow "[*] 同步 Psiphon 端口到 sing-box (端口: $port)..."
+
+    python3 - <<PY
+import json
+import sys
+
+cfg_path = r"$cfg"
+port = int(r"$port")
+psiphon_tag = r"$psiphon_tag"
+
+try:
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception as e:
+    print(f"[!] 读取配置失败: {e}")
+    sys.exit(1)
+
+outbounds = data.get("outbounds", [])
+found = False
+
+for o in outbounds:
+    if o.get("tag") == psiphon_tag:
+        old_port = o.get("server_port", 0)
+        if old_port == port:
+            print(f"[*] 端口未变化 ({port})，跳过")
+            sys.exit(0)
+        o["server"] = "127.0.0.1"
+        o["server_port"] = port
+        found = True
+        break
+
+if not found:
+    print("[*] sing-box 配置中无 Psiphon 出站，跳过同步")
+    sys.exit(0)
+
+try:
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"[+] sing-box 已更新 Psiphon 端口: {port}")
+except Exception as e:
+    print(f"[!] 写入配置失败: {e}")
+    sys.exit(1)
+PY
+
+    if [ $? -ne 0 ]; then
+        red "[!] 同步端口失败"
+        return 1
+    fi
+    
+    # 重启 sing-box 使配置生效
+    start_singbox_safe || return 1
+    return 0
 }
 
 # 停止 Psiphon
@@ -1678,7 +1757,7 @@ get_country_name() {
     esac
 }
 
-# 出口 IP 检测 (等价 psictl egress-test)
+# 出口 IP 检测 (等价 psictl egress-test) - 优化版，减少 fork 压力
 psiphon_egress_test() {
     local socks
     socks="$(get_psiphon_socks_port)"
@@ -1690,27 +1769,29 @@ psiphon_egress_test() {
 
     yellow "[*] 正在检测 Psiphon 出口 IP..."
     
-    # 检查 Psiphon 是否在运行
-    if ! pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1; then
+    # 检查 Psiphon 是否在运行 (使用 kill -0 代替 pgrep 减少 fork)
+    local psi_pid
+    psi_pid="$(cat "$WORKDIR/psiphon.pid" 2>/dev/null || pgrep -f "psiphon-tunnel-core" | head -n1)"
+    if [[ -z "$psi_pid" ]] || ! kill -0 "$psi_pid" 2>/dev/null; then
         red "[!] Psiphon 未运行"
         return 1
     fi
 
-    local json
+    local json=""
     # 尝试 ipinfo.io (可能限流/403)
-    json="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" https://ipinfo.io/json 2>/dev/null || true)"
+    json="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" https://ipinfo.io/json 2>/dev/null)" || true
     
     # fallback 到 ip-api.com (免费无 key，但只有 HTTP)
     if [[ -z "$json" ]]; then
         yellow "[*] ipinfo.io 无响应，尝试 ip-api.com..."
-        json="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" http://ip-api.com/json 2>/dev/null || true)"
+        json="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" http://ip-api.com/json 2>/dev/null)" || true
     fi
     
     # fallback 到 ifconfig.me (只返回 IP)
     if [[ -z "$json" ]]; then
         yellow "[*] ip-api.com 无响应，尝试 ifconfig.me..."
         local raw_ip
-        raw_ip="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" https://ifconfig.me 2>/dev/null || true)"
+        raw_ip="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" https://ifconfig.me 2>/dev/null)" || true
         if [[ -n "$raw_ip" ]]; then
             green "  IP: $raw_ip"
             yellow "  (其他信息无法获取，但 SOCKS 隧道正常)"
@@ -1725,20 +1806,16 @@ psiphon_egress_test() {
         return 1
     fi
 
-    # 解析 JSON
-    python3 - <<PY
-import json
-import sys
-
-raw = '''$json'''
+    # 解析 JSON - 使用 python3 -c 代替 heredoc (减少 /tmp 临时文件，减少 fork)
+    python3 -c '
+import json, sys
 try:
-    j = json.loads(raw)
-    ip = j.get('ip') or j.get('query') or ''
-    country = j.get('country') or j.get('countryCode') or ''
-    org = j.get('org') or j.get('isp') or ''
-    city = j.get('city') or ''
-    region = j.get('region') or j.get('regionName') or ''
-    
+    j = json.load(sys.stdin)
+    ip = j.get("ip") or j.get("query") or ""
+    country = j.get("country") or j.get("countryCode") or ""
+    city = j.get("city") or ""
+    region = j.get("region") or j.get("regionName") or ""
+    org = j.get("org") or j.get("isp") or ""
     print(f"  IP:      {ip}")
     print(f"  国家:    {country}")
     print(f"  城市:    {city}")
@@ -1747,7 +1824,7 @@ try:
 except Exception as e:
     print(f"[!] 解析失败: {e}")
     sys.exit(1)
-PY
+' <<<"$json"
     
     return 0
 }
@@ -1768,8 +1845,15 @@ psiphon_set_region() {
     
     if [ $? -eq 0 ]; then
         green "[+] 已切换到 $cc ($name)"
+        
+        # 关键修复：同步新端口到 sing-box 配置并重启
+        # Psiphon 使用随机端口，切换国家后端口会变化
+        sync_psiphon_port_to_singbox || {
+            yellow "[!] 端口同步失败，节点可能无法正常使用"
+        }
+        
         # 等待连接建立
-        sleep 3
+        sleep 2
         psiphon_egress_test || true
     else
         red "[!] 切换失败"
@@ -2047,7 +2131,13 @@ psiphon_management_menu() {
                 ;;
             8)
                 yellow "正在重启 Psiphon..."
-                start_psiphon_userland && green "重启成功" || red "重启失败"
+                if start_psiphon_userland; then
+                    green "Psiphon 重启成功"
+                    # 同步新端口到 sing-box (因为随机端口可能变化)
+                    sync_psiphon_port_to_singbox || yellow "[!] 端口同步失败"
+                else
+                    red "Psiphon 重启失败"
+                fi
                 ;;
             0)
                 return 0
