@@ -1398,6 +1398,44 @@ start_psiphon_userland() {
     return 0
 }
 
+# 可靠启动 sing-box（使用绝对路径，不依赖当前目录）
+start_singbox_safe() {
+    local SB_BINARY
+    SB_BINARY="$(cat "$WORKDIR/sb.txt" 2>/dev/null)"
+    
+    if [[ -z "$SB_BINARY" || ! -f "$WORKDIR/$SB_BINARY" ]]; then
+        red "[!] sing-box 二进制不存在"
+        return 1
+    fi
+
+    # 校验配置
+    local out
+    out="$(cd "$WORKDIR" && "./$SB_BINARY" check -c "$WORKDIR/config.json" 2>&1)" || {
+        red "[!] sing-box 配置校验失败："
+        echo "$out" | head -30
+        return 1
+    }
+
+    # 停止旧进程（用绝对路径匹配）
+    pkill -f "$WORKDIR/$SB_BINARY" >/dev/null 2>&1 || true
+    pkill -x "$SB_BINARY" >/dev/null 2>&1 || true
+    sleep 1
+
+    # 启动（使用绝对路径）
+    cd "$WORKDIR"
+    nohup "$WORKDIR/$SB_BINARY" run -c "$WORKDIR/config.json" >> "$WORKDIR/singbox.log" 2>&1 &
+    sleep 2
+
+    if pgrep -f "$WORKDIR/$SB_BINARY" >/dev/null 2>&1 || pgrep -x "$SB_BINARY" >/dev/null 2>&1; then
+        green "[+] sing-box 重启成功"
+        return 0
+    else
+        red "[!] sing-box 启动失败，查看日志：$WORKDIR/singbox.log"
+        tail -20 "$WORKDIR/singbox.log" 2>/dev/null
+        return 1
+    fi
+}
+
 # 停止 Psiphon
 stop_psiphon_userland() {
     # 只杀自己目录的二进制 (避免误杀系统进程)
@@ -1519,7 +1557,11 @@ PY
         return 1
     fi
 
+    echo "true" > "$WORKDIR/psiphon_enabled.txt"
     green "[+] Psiphon 出站配置完成"
+    
+    # 使用可靠的重启函数
+    start_singbox_safe || return 1
     return 0
 }
 
@@ -1585,6 +1627,9 @@ PY
 
     echo "false" > "$WORKDIR/psiphon_enabled.txt"
     green "[+] Psiphon 已关闭"
+    
+    # 使用可靠的重启函数
+    start_singbox_safe || return 1
     return 0
 }
 
