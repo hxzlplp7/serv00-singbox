@@ -1072,10 +1072,55 @@ init_psiphon_state_files() {
     [[ -f "$WORKDIR/psiphon_enabled.txt" ]]    || echo "false" > "$WORKDIR/psiphon_enabled.txt"
     [[ -f "$WORKDIR/psiphon_mode.txt" ]]       || echo "all"   > "$WORKDIR/psiphon_mode.txt"
     [[ -f "$WORKDIR/psiphon_region.txt" ]]     || echo "US"    > "$WORKDIR/psiphon_region.txt"
-    [[ -f "$WORKDIR/psiphon_socks_port.txt" ]] || echo "2080"  > "$WORKDIR/psiphon_socks_port.txt"
-    [[ -f "$WORKDIR/psiphon_http_port.txt" ]]  || echo "2081"  > "$WORKDIR/psiphon_http_port.txt"
+    # 使用 0 表示自动端口 (FreeBSD mac_portacl 限制固定端口绑定)
+    [[ -f "$WORKDIR/psiphon_socks_port.txt" ]] || echo "0"     > "$WORKDIR/psiphon_socks_port.txt"
+    [[ -f "$WORKDIR/psiphon_http_port.txt" ]]  || echo "0"     > "$WORKDIR/psiphon_http_port.txt"
     [[ -f "$WORKDIR/psi.txt" ]]                || : > "$WORKDIR/psi.txt"
     [[ -f "$WORKDIR/psiphon.log" ]]            || : > "$WORKDIR/psiphon.log"
+    # 运行时实际监听端口文件 (自动端口模式必需)
+    [[ -f "$WORKDIR/psiphon_socks_listen.txt" ]] || : > "$WORKDIR/psiphon_socks_listen.txt"
+    [[ -f "$WORKDIR/psiphon_http_listen.txt" ]]  || : > "$WORKDIR/psiphon_http_listen.txt"
+}
+
+# 获取 Psiphon 实际 SOCKS 端口 (优先读运行时端口)
+get_psiphon_socks_port() {
+    local p=""
+    # 优先读运行时实际监听端口
+    p="$(cat "$WORKDIR/psiphon_socks_listen.txt" 2>/dev/null || true)"
+    if [[ "$p" =~ ^[0-9]+$ ]] && (( p > 0 )); then
+        echo "$p"
+        return 0
+    fi
+    # fallback: 读配置端口 (可能是 0)
+    p="$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null || true)"
+    if [[ "$p" =~ ^[0-9]+$ ]] && (( p > 0 )); then
+        echo "$p"
+        return 0
+    fi
+    echo "0"
+}
+
+# 从 psiphon.log 解析实际监听端口 (ListeningSocksProxyPort notice)
+psiphon_update_listen_ports_from_log() {
+    local log="$WORKDIR/psiphon.log"
+    local socks http
+    
+    # 解析 SOCKS 端口
+    socks="$(grep -a '"noticeType":"ListeningSocksProxyPort"' "$log" 2>/dev/null \
+        | tail -n 1 \
+        | sed -E 's/.*"port":[[:space:]]*([0-9]+).*/\1/' )"
+    if [[ "$socks" =~ ^[0-9]+$ ]] && (( socks > 0 )); then
+        echo "$socks" > "$WORKDIR/psiphon_socks_listen.txt"
+        green "[+] Psiphon SOCKS 实际端口: $socks"
+    fi
+
+    # 解析 HTTP 端口
+    http="$(grep -a '"noticeType":"ListeningHttpProxyPort"' "$log" 2>/dev/null \
+        | tail -n 1 \
+        | sed -E 's/.*"port":[[:space:]]*([0-9]+).*/\1/' )"
+    if [[ "$http" =~ ^[0-9]+$ ]] && (( http > 0 )); then
+        echo "$http" > "$WORKDIR/psiphon_http_listen.txt"
+    fi
 }
 
 # 检测操作系统
@@ -1190,13 +1235,12 @@ install_psiphon_userland() {
 
 # 生成 Psiphon 配置文件
 write_psiphon_config() {
-    local socks http region datadir
+    local socks region datadir
     socks="$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null)"
-    http="$(cat "$WORKDIR/psiphon_http_port.txt" 2>/dev/null)"
     region="$(cat "$WORKDIR/psiphon_region.txt" 2>/dev/null)"
     
-    socks="${socks:-2080}"
-    http="${http:-2081}"
+    # FreeBSD mac_portacl 限制固定端口 bind，必须用 0 (自动端口)
+    socks="${socks:-0}"
     region="${region:-US}"
     
     # AUTO 时写空字符串
@@ -1213,8 +1257,9 @@ write_psiphon_config() {
   "EmitDiagnosticNetworkParameters": true,
   "EmitServerAlerts": true,
   
-  "LocalHttpProxyPort": ${http},
   "LocalSocksProxyPort": ${socks},
+  "DisableLocalHTTPProxy": true,
+  "LocalHttpProxyPort": 0,
   "EgressRegion": "${region}",
   
   "PropagationChannelId": "FFFFFFFFFFFFFFFF",
@@ -1225,15 +1270,12 @@ write_psiphon_config() {
   "UseIndistinguishableTLS": true
 }
 EOF
-    green "[+] Psiphon 配置已生成 (数据目录: $datadir)"
+    green "[+] Psiphon 配置已生成 (SOCKS: 自动端口, 数据目录: $datadir)"
 }
 
 # 等待 Psiphon 就绪 (基于 notice 事件检测)
 psiphon_wait_ready() {
     local log="$WORKDIR/psiphon.log"
-    local socks_port
-    socks_port="$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null)"
-    socks_port="${socks_port:-2080}"
 
     # FreeBSD 共享机冷启动可能需要较长时间，等待 60 秒
     local timeout=60
@@ -1244,39 +1286,34 @@ psiphon_wait_ready() {
     while (( elapsed < timeout )); do
         # 1) 检查端口占用 notice
         if tail -n 200 "$log" 2>/dev/null | grep -q '"noticeType":"SocksProxyPortInUse"'; then
-            red "[!] Psiphon SOCKS 端口被占用：$socks_port"
-            yellow "    建议修改端口: echo 新端口 > $WORKDIR/psiphon_socks_port.txt"
+            red "[!] Psiphon SOCKS 端口被占用"
+            yellow "    如果使用固定端口请换一个，或使用 0 (自动端口)"
             return 2
         fi
 
         # 2) 检查已开始监听 notice (最可靠的就绪信号)
         if tail -n 400 "$log" 2>/dev/null | grep -q '"noticeType":"ListeningSocksProxyPort"'; then
-            green "[+] Psiphon SOCKS 端口已监听"
+            # 解析实际端口
+            psiphon_update_listen_ports_from_log
+            local actual_port
+            actual_port="$(get_psiphon_socks_port)"
+            green "[+] Psiphon SOCKS 已监听 (端口: $actual_port)"
             return 0
         fi
 
         # 3) 检查 Tunnels notice (已建立隧道)
         if tail -n 400 "$log" 2>/dev/null | grep -q '"noticeType":"Tunnels"'; then
             if tail -n 400 "$log" 2>/dev/null | grep '"noticeType":"Tunnels"' | grep -q '"count":[1-9]'; then
-                green "[+] Psiphon 隧道已建立"
+                # 隧道建立，也解析端口
+                psiphon_update_listen_ports_from_log
+                local actual_port
+                actual_port="$(get_psiphon_socks_port)"
+                green "[+] Psiphon 隧道已建立 (SOCKS: $actual_port)"
                 return 0
             fi
         fi
 
-        # 4) 兜底：检查本地端口是否监听 (FreeBSD 用 sockstat)
-        if command -v sockstat >/dev/null 2>&1; then
-            if sockstat -4l 2>/dev/null | grep -q ":${socks_port} "; then
-                green "[+] Psiphon SOCKS 端口已监听 (sockstat)"
-                return 0
-            fi
-        else
-            if netstat -an 2>/dev/null | grep -q "\.${socks_port} .*LISTEN"; then
-                green "[+] Psiphon SOCKS 端口已监听 (netstat)"
-                return 0
-            fi
-        fi
-
-        # 5) 检查进程是否还活着
+        # 4) 检查进程是否还活着
         if ! pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1; then
             red "[!] Psiphon 进程已退出"
             tail -15 "$log" 2>/dev/null
@@ -1292,6 +1329,8 @@ psiphon_wait_ready() {
     yellow "[!] 等待 Psiphon 就绪超时 (${timeout}s)"
     yellow "    日志里没看到 ListeningSocksProxyPort，但进程可能仍在运行"
     yellow "    建议稍后使用菜单 11 检测出口 IP"
+    # 尝试解析端口
+    psiphon_update_listen_ports_from_log
     # 不返回 1，因为可能只是检测不到 notice 但实际已就绪
     return 0
 }
@@ -1306,6 +1345,10 @@ start_psiphon_userland() {
         install_psiphon_userland || return 1
     fi
     
+    # 清理上一次的运行时端口文件
+    : > "$WORKDIR/psiphon_socks_listen.txt" 2>/dev/null || true
+    : > "$WORKDIR/psiphon_http_listen.txt" 2>/dev/null || true
+    
     write_psiphon_config
 
     # 先停止旧进程
@@ -1314,16 +1357,13 @@ start_psiphon_userland() {
     # 清空旧日志 (便于检测新 notice)
     > "$WORKDIR/psiphon.log" 2>/dev/null
 
-    local socks_port=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null)
-    socks_port="${socks_port:-2080}"
-    
-    yellow "[*] 启动 Psiphon (SOCKS: 127.0.0.1:${socks_port})..."
+    yellow "[*] 启动 Psiphon (SOCKS: 自动端口 127.0.0.1:0)..."
     cd "$WORKDIR"
     nohup "$bin" -config "$WORKDIR/psiphon.config" >>"$WORKDIR/psiphon.log" 2>&1 &
+    local pid=$!
     
     # 给进程一点启动时间
     sleep 2
-    local pid=$!
 
     # 检查进程是否启动 (如果秒退，用前台模式抓错误)
     if ! kill -0 "$pid" 2>/dev/null && ! pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1; then
@@ -1338,7 +1378,7 @@ start_psiphon_userland() {
         return 1
     fi
 
-    # 等待就绪 (基于 notice 检测)
+    # 等待就绪 (基于 notice 检测，并自动解析实际端口)
     psiphon_wait_ready
     local ready_status=$?
     
@@ -1347,7 +1387,14 @@ start_psiphon_userland() {
         return 1
     fi
 
-    green "[+] Psiphon 已启动"
+    # 显示实际端口
+    local actual_port
+    actual_port="$(get_psiphon_socks_port)"
+    if [[ "$actual_port" != "0" && -n "$actual_port" ]]; then
+        green "[+] Psiphon 已启动 (SOCKS: 127.0.0.1:${actual_port})"
+    else
+        yellow "[!] Psiphon 已启动，但未能获取实际端口"
+    fi
     return 0
 }
 
@@ -1363,12 +1410,16 @@ stop_psiphon_userland() {
 apply_egress_mode_psiphon() {
     local mode="$1"   # all / google
     local cfg="$WORKDIR/config.json"
-    local socks_port
-    socks_port="$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null)"
-    socks_port="${socks_port:-2080}"
 
-    # 确保 psiphon 在跑
+    # 先启动 psiphon，再获取实际端口
     start_psiphon_userland || return 1
+    
+    local socks_port
+    socks_port="$(get_psiphon_socks_port)"
+    if [[ "$socks_port" == "0" || -z "$socks_port" ]]; then
+        red "[!] 无法获取 Psiphon 实际端口"
+        return 1
+    fi
 
     # 备份配置
     cp "$cfg" "$cfg.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null
@@ -1585,8 +1636,12 @@ get_country_name() {
 # 出口 IP 检测 (等价 psictl egress-test)
 psiphon_egress_test() {
     local socks
-    socks="$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null)"
-    socks="${socks:-2080}"
+    socks="$(get_psiphon_socks_port)"
+    
+    if [[ "$socks" == "0" || -z "$socks" ]]; then
+        red "[!] 未获取到 Psiphon 实际端口"
+        return 1
+    fi
 
     yellow "[*] 正在检测 Psiphon 出口 IP..."
     
@@ -1683,9 +1738,6 @@ psiphon_country_test() {
     [[ ${#list[@]} -ge 1 ]] || { red "用法: psiphon_country_test US JP SG ..."; return 1; }
 
     local ok=() fail=() mismatch=()
-    local socks
-    socks="$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null)"
-    socks="${socks:-2080}"
 
     for cc in "${list[@]}"; do
         cc="${cc^^}"
@@ -1702,6 +1754,15 @@ psiphon_country_test() {
         
         # 等待连接
         sleep 4
+        
+        # 获取实际端口
+        local socks
+        socks="$(get_psiphon_socks_port)"
+        if [[ "$socks" == "0" || -z "$socks" ]]; then
+            red "  [-] FAIL (无法获取端口)"
+            fail+=("$cc")
+            continue
+        fi
 
         # 查出口 country
         local json got
@@ -1866,9 +1927,8 @@ psiphon_management_menu() {
         # 显示当前状态
         local psi_enabled=$(cat "$WORKDIR/psiphon_enabled.txt" 2>/dev/null)
         local psi_region=$(cat "$WORKDIR/psiphon_region.txt" 2>/dev/null)
-        local psi_socks=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null)
+        local psi_socks=$(get_psiphon_socks_port)
         psi_region="${psi_region:-AUTO}"
-        psi_socks="${psi_socks:-2080}"
         
         if [[ "$psi_enabled" == "true" ]]; then
             local region_name=$(get_country_name "$psi_region")
