@@ -99,6 +99,8 @@ init_directories() {
     [ -d "$WORKDIR" ] || (mkdir -p "$WORKDIR" && chmod 777 "$WORKDIR")
     [ -d "$KEEP_PATH" ] || mkdir -p "$KEEP_PATH"
     devil binexec on >/dev/null 2>&1
+    # 初始化 Psiphon 状态文件 (升级覆盖时自动补齐)
+    init_psiphon_state_files
 }
 
 # 获取所有可用IP
@@ -1056,6 +1058,788 @@ ask_warp_outbound() {
     # 保存设置
     echo "$WARP_ENABLED" > "$WORKDIR/warp_enabled.txt"
     echo "$WARP_MODE" > "$WORKDIR/warp_mode.txt"
+}
+
+# ==================== Psiphon 出站配置 ====================
+# Psiphon ConsoleClient 下载配置
+PSI_REPO_OWNER="hxzlplp7"
+PSI_REPO_NAME="psiphon-tunnel-core"
+PSI_TAG_DEFAULT="v1.0.0"
+
+# 初始化 Psiphon 状态文件 (升级覆盖时自动补齐)
+init_psiphon_state_files() {
+    : "${WORKDIR:?WORKDIR not set}"
+    [[ -f "$WORKDIR/psiphon_enabled.txt" ]]    || echo "false" > "$WORKDIR/psiphon_enabled.txt"
+    [[ -f "$WORKDIR/psiphon_mode.txt" ]]       || echo "all"   > "$WORKDIR/psiphon_mode.txt"
+    [[ -f "$WORKDIR/psiphon_region.txt" ]]     || echo "US"    > "$WORKDIR/psiphon_region.txt"
+    [[ -f "$WORKDIR/psiphon_socks_port.txt" ]] || echo "2080"  > "$WORKDIR/psiphon_socks_port.txt"
+    [[ -f "$WORKDIR/psiphon_http_port.txt" ]]  || echo "2081"  > "$WORKDIR/psiphon_http_port.txt"
+    [[ -f "$WORKDIR/psi.txt" ]]                || : > "$WORKDIR/psi.txt"
+    [[ -f "$WORKDIR/psiphon.log" ]]            || : > "$WORKDIR/psiphon.log"
+}
+
+# 检测操作系统
+detect_os_slim() {
+    case "$(uname -s | tr '[:upper:]' '[:lower:]')" in
+        linux) echo "linux" ;;
+        freebsd) echo "freebsd" ;;
+        *) echo "unsupported" ;;
+    esac
+}
+
+# 检测架构
+detect_arch_slim() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        *) echo "unknown" ;;
+    esac
+}
+
+# 安装 Psiphon ConsoleClient (无 root 版本)
+install_psiphon_userland() {
+    local os arch tag base url tmpd
+    os="$(detect_os_slim)"
+    arch="$(detect_arch_slim)"
+
+    [[ "$os" != "unsupported" ]] || { red "[!] 不支持的系统: $(uname -s)"; return 1; }
+    [[ "$arch" != "unknown" ]]   || { red "[!] 不支持的架构: $(uname -m)"; return 1; }
+
+    tmpd="$(mktemp -d)"
+    tag="${PSI_TAG_DEFAULT}"
+    base="https://github.com/${PSI_REPO_OWNER}/${PSI_REPO_NAME}/releases/download/${tag}"
+
+    # 候选文件名列表 (按优先级)
+    local candidates=(
+        "psiphon-tunnel-core-${os}-${arch}.tar.gz"
+        "psiphon-tunnel-core-${os}-${arch}.tgz"
+        "psiphon-tunnel-core-${os}-${arch}.zip"
+        "psiphon-tunnel-core-${os}-${arch}"
+        "psiphon-tunnel-core-${os}_${arch}.tar.gz"
+        "psiphon-tunnel-core_${os}_${arch}.tar.gz"
+    )
+
+    local picked=""
+    yellow "[*] 正在探测 Psiphon 资产文件..."
+    for f in "${candidates[@]}"; do
+        url="${base}/${f}"
+        if curl -fsIL "$url" >/dev/null 2>&1; then
+            picked="$f"
+            break
+        fi
+    done
+
+    [[ -n "$picked" ]] || {
+        red "[!] 未在 release ${tag} 找到匹配的 ${os}/${arch} 资产"
+        yellow "    已尝试的文件名: ${candidates[*]}"
+        rm -rf "$tmpd"
+        return 1
+    }
+
+    url="${base}/${picked}"
+    green "[*] 下载 Psiphon: $picked"
+    curl -fsSL "$url" -o "${tmpd}/${picked}" || {
+        red "[!] 下载失败: $url"
+        rm -rf "$tmpd"
+        return 1
+    }
+
+    # SHA256 校验 (如果有)
+    local sha_url="${url}.sha256"
+    if curl -fsIL "$sha_url" >/dev/null 2>&1; then
+        curl -fsSL "$sha_url" -o "${tmpd}/${picked}.sha256"
+        local expected actual
+        expected="$(grep -Eo '[0-9a-fA-F]{64}' "${tmpd}/${picked}.sha256" | head -n1 | tr '[:upper:]' '[:lower:]')"
+        if command -v sha256sum >/dev/null 2>&1; then
+            actual="$(sha256sum "${tmpd}/${picked}" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
+        else
+            actual="$(sha256 -q "${tmpd}/${picked}" | tr '[:upper:]' '[:lower:]')"
+        fi
+        if [[ "$expected" != "$actual" ]]; then
+            red "[!] Psiphon SHA256 校验失败"
+            yellow "    期望: $expected"
+            yellow "    实际: $actual"
+            rm -rf "$tmpd"
+            return 1
+        fi
+        green "[+] SHA256 校验通过"
+    fi
+
+    # 解包/落地 (兼容 tar.gz、zip、裸二进制)
+    if [[ "$picked" == *.tar.gz || "$picked" == *.tgz ]]; then
+        tar -xzf "${tmpd}/${picked}" -C "$tmpd"
+        local extracted
+        extracted="$(find "$tmpd" -maxdepth 2 -type f -name 'psiphon-tunnel-core*' ! -name '*.tar.gz' ! -name '*.sha256' | head -n1)"
+        [[ -n "$extracted" ]] || { red "[!] 解压未找到可执行文件"; rm -rf "$tmpd"; return 1; }
+        cp -f "$extracted" "$WORKDIR/psiphon-tunnel-core"
+    elif [[ "$picked" == *.zip ]]; then
+        unzip -o "${tmpd}/${picked}" -d "$tmpd" >/dev/null
+        local extracted
+        extracted="$(find "$tmpd" -maxdepth 2 -type f -name 'psiphon-tunnel-core*' ! -name '*.zip' ! -name '*.sha256' | head -n1)"
+        [[ -n "$extracted" ]] || { red "[!] 解压未找到可执行文件"; rm -rf "$tmpd"; return 1; }
+        cp -f "$extracted" "$WORKDIR/psiphon-tunnel-core"
+    else
+        cp -f "${tmpd}/${picked}" "$WORKDIR/psiphon-tunnel-core"
+    fi
+
+    chmod +x "$WORKDIR/psiphon-tunnel-core"
+    echo "psiphon-tunnel-core" > "$WORKDIR/psi.txt"
+    rm -rf "$tmpd"
+    green "[+] Psiphon 已安装到 $WORKDIR/psiphon-tunnel-core"
+}
+
+# 生成 Psiphon 配置文件
+write_psiphon_config() {
+    local socks http region
+    socks="$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null)"
+    http="$(cat "$WORKDIR/psiphon_http_port.txt" 2>/dev/null)"
+    region="$(cat "$WORKDIR/psiphon_region.txt" 2>/dev/null)"
+    
+    socks="${socks:-2080}"
+    http="${http:-2081}"
+    region="${region:-US}"
+
+    cat > "$WORKDIR/psiphon.config" <<EOF
+{
+  "LocalHttpProxyPort": ${http},
+  "LocalSocksProxyPort": ${socks},
+  "EgressRegion": "${region}",
+  "PropagationChannelId": "FFFFFFFFFFFFFFFF",
+  "SponsorId": "FFFFFFFFFFFFFFFF",
+  "RemoteServerListDownloadFilename": "${WORKDIR}/remote_server_list",
+  "RemoteServerListSignaturePublicKey": "MIICIDANBgkqhkiG9w0BAQEFAAOCAg0AMIICCAKCAgEAt7Ls+/39r+T6zNW7GiVpJfzq/xvL9SBH5rIFnk0RXYEYavax3WS6HOD35eTAqn8AniOwiH+DOkvgSKF2caqk/y1dfq47Pdymtwzp9ikpB1C5OfAysXzBiwVJlCdajBKvBZDerV1cMvRzCKvKwRmvDmHgphQQ7WfXIGbRbmmk6opMBh3roE42KcotLFtqp0RRwLtcBRNtCdsrVsjiI1Lqz/lH+T61sGjSjQ3CHMuZYSQJZo/KrvzgQXpkaCTdbObxHqb6/+i1qaVOfEsvjoiyzTxJADvSytVtcTjijhPEV6XskJVHE1Zgl+7rATr/pDQkw6DPCNBS1+Y6fy7GstZALQXwEDN/qhQI9kWkHijT8ns+i1vGg00Mk/6J75arLhqcodWsdeG/M/moWgqQAnlZAGVtJI1OgeF5fsPpXu4kctOfuZlGjVZXQNW34aOzm8r8S0eVZitPlbhcPiR4gT/aSMz/wd8lZlzZYsje/Jr8u/YtlwjjreZrGRmG8KMOzukV3lLmMppXFMvl4bxv6YFEmIuTsOhbLTwFgh7KYNjodLj/LsqRVfwz31PgWQFTEPICV7GCvgVlPRxnofqKSjgTWI4mxDhBpVcATvaoBl1L/6WLbFvBsoAUBItWwctO2xalKxF5szhGm8lccoc5MZr8kfE0uxMgsxz4er68iCID+rsCAQM=",
+  "RemoteServerListUrl": "https://s3.amazonaws.com//psiphon/web/mjr4-p23r-puwl/server_list_compressed",
+  "UseIndistinguishableTLS": true
+}
+EOF
+    green "[+] Psiphon 配置已生成"
+}
+
+# 启动 Psiphon (nohup 版本)
+start_psiphon_userland() {
+    local bin="$WORKDIR/psiphon-tunnel-core"
+    
+    # 检查二进制是否存在，不存在则安装
+    if [[ ! -x "$bin" ]]; then
+        yellow "[*] Psiphon 二进制不存在，正在安装..."
+        install_psiphon_userland || return 1
+    fi
+    
+    write_psiphon_config
+
+    # 先停止旧进程
+    stop_psiphon_userland
+
+    local socks_port=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null)
+    socks_port="${socks_port:-2080}"
+    
+    yellow "[*] 启动 Psiphon (SOCKS: 127.0.0.1:${socks_port})..."
+    cd "$WORKDIR"
+    nohup "$bin" -config "$WORKDIR/psiphon.config" >>"$WORKDIR/psiphon.log" 2>&1 &
+    
+    # 等待启动
+    sleep 3
+    
+    if pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1; then
+        green "[+] Psiphon 启动成功"
+        return 0
+    else
+        red "[!] Psiphon 启动失败，请检查日志: $WORKDIR/psiphon.log"
+        tail -20 "$WORKDIR/psiphon.log" 2>/dev/null
+        return 1
+    fi
+}
+
+# 停止 Psiphon
+stop_psiphon_userland() {
+    # 只杀自己目录的二进制 (避免误杀系统进程)
+    pkill -f "$WORKDIR/psiphon-tunnel-core" >/dev/null 2>&1 || true
+    pkill -f "psiphon-tunnel-core.*psiphon.config" >/dev/null 2>&1 || true
+    sleep 1
+}
+
+# 应用 Psiphon 出站模式 (使用 Python 稳定修改 JSON)
+apply_egress_mode_psiphon() {
+    local mode="$1"   # all / google
+    local cfg="$WORKDIR/config.json"
+    local socks_port
+    socks_port="$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null)"
+    socks_port="${socks_port:-2080}"
+
+    # 确保 psiphon 在跑
+    start_psiphon_userland || return 1
+
+    # 备份配置
+    cp "$cfg" "$cfg.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null
+
+    yellow "[*] 更新 sing-box 配置 (添加 Psiphon SOCKS 出站)..."
+
+    python3 - <<PY
+import json
+import sys
+
+cfg_path = r"$cfg"
+mode = r"$mode"
+socks_port = int(r"$socks_port")
+
+try:
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception as e:
+    print(f"[!] 读取配置失败: {e}")
+    sys.exit(1)
+
+outbounds = data.setdefault("outbounds", [])
+route = data.setdefault("route", {})
+rules = route.setdefault("rules", [])
+
+def first_tag_by_type(t, fallback):
+    for o in outbounds:
+        if o.get("type") == t and o.get("tag"):
+            return o["tag"]
+    return fallback
+
+direct_tag = first_tag_by_type("direct", "direct")
+psiphon_tag = "psiphon-out"
+
+# upsert psiphon outbound (SOCKS5)
+found = False
+for o in outbounds:
+    if o.get("tag") == psiphon_tag:
+        o.clear()
+        o.update({
+            "type": "socks",
+            "tag": psiphon_tag,
+            "server": "127.0.0.1",
+            "server_port": socks_port,
+            "version": "5",
+            "network": "tcp"
+        })
+        found = True
+        break
+
+if not found:
+    outbounds.append({
+        "type": "socks",
+        "tag": psiphon_tag,
+        "server": "127.0.0.1",
+        "server_port": socks_port,
+        "version": "5",
+        "network": "tcp"
+    })
+
+# 移除旧的 psiphon 规则 (幂等)
+def is_our_rule(r):
+    return r.get("outbound") == psiphon_tag and ("domain_suffix" in r or "rule_set" in r)
+
+rules[:] = [r for r in rules if not is_our_rule(r)]
+
+if mode == "all":
+    route["final"] = psiphon_tag
+elif mode == "google":
+    # 分流模式: Google/YouTube/OpenAI 走 Psiphon
+    rules.insert(0, {
+        "domain_suffix": [
+            "google.com", "google.co.jp", "google.com.hk",
+            "googleapis.com", "gstatic.com", "ggpht.com",
+            "youtube.com", "ytimg.com", "youtu.be",
+            "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
+            "netflix.com", "nflxvideo.net", "nflxso.net"
+        ],
+        "outbound": psiphon_tag
+    })
+    route["final"] = direct_tag
+else:
+    print(f"[!] 未知模式: {mode}")
+    sys.exit(1)
+
+try:
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print("[+] sing-box 配置已更新 (Psiphon 出站)")
+except Exception as e:
+    print(f"[!] 写入配置失败: {e}")
+    sys.exit(1)
+PY
+
+    if [ $? -ne 0 ]; then
+        red "[!] 配置更新失败"
+        return 1
+    fi
+
+    green "[+] Psiphon 出站配置完成"
+    return 0
+}
+
+# 关闭 Psiphon 出站 (恢复直连或 WARP)
+disable_psiphon_egress() {
+    local cfg="$WORKDIR/config.json"
+    
+    stop_psiphon_userland
+    
+    # 备份配置
+    cp "$cfg" "$cfg.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null
+
+    yellow "[*] 移除 Psiphon 出站配置..."
+
+    python3 - <<PY
+import json
+import sys
+
+cfg_path = r"$cfg"
+
+try:
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception as e:
+    print(f"[!] 读取配置失败: {e}")
+    sys.exit(1)
+
+outbounds = data.get("outbounds", [])
+route = data.get("route", {})
+rules = route.get("rules", [])
+
+psiphon_tag = "psiphon-out"
+
+# 移除 psiphon outbound
+outbounds[:] = [o for o in outbounds if o.get("tag") != psiphon_tag]
+
+# 移除 psiphon 相关规则
+rules[:] = [r for r in rules if r.get("outbound") != psiphon_tag]
+
+# 恢复 final 为 direct
+def first_tag_by_type(t, fallback):
+    for o in outbounds:
+        if o.get("type") == t and o.get("tag"):
+            return o["tag"]
+    return fallback
+
+direct_tag = first_tag_by_type("direct", "direct")
+route["final"] = direct_tag
+
+try:
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print("[+] Psiphon 出站已移除，恢复直连")
+except Exception as e:
+    print(f"[!] 写入配置失败: {e}")
+    sys.exit(1)
+PY
+
+    if [ $? -ne 0 ]; then
+        red "[!] 配置更新失败"
+        return 1
+    fi
+
+    echo "false" > "$WORKDIR/psiphon_enabled.txt"
+    green "[+] Psiphon 已关闭"
+    return 0
+}
+
+# ==================== Psiphon 国家管理 (psictl 等价功能) ====================
+
+# 常用国家码列表
+PSI_ALL_CC=(US JP SG HK TW KR GB DE FR NL CA AU AT BE CH CZ DK EE ES FI HU IE IN IT LV NO PL RO RS SE SK)
+
+# 国家码到中文名映射
+get_country_name() {
+    local cc="${1^^}"
+    case "$cc" in
+        US) echo "美国" ;;
+        JP) echo "日本" ;;
+        SG) echo "新加坡" ;;
+        HK) echo "香港" ;;
+        TW) echo "台湾" ;;
+        KR) echo "韩国" ;;
+        GB) echo "英国" ;;
+        DE) echo "德国" ;;
+        FR) echo "法国" ;;
+        NL) echo "荷兰" ;;
+        CA) echo "加拿大" ;;
+        AU) echo "澳大利亚" ;;
+        AT) echo "奥地利" ;;
+        BE) echo "比利时" ;;
+        CH) echo "瑞士" ;;
+        CZ) echo "捷克" ;;
+        DK) echo "丹麦" ;;
+        EE) echo "爱沙尼亚" ;;
+        ES) echo "西班牙" ;;
+        FI) echo "芬兰" ;;
+        HU) echo "匈牙利" ;;
+        IE) echo "爱尔兰" ;;
+        IN) echo "印度" ;;
+        IT) echo "意大利" ;;
+        LV) echo "拉脱维亚" ;;
+        NO) echo "挪威" ;;
+        PL) echo "波兰" ;;
+        RO) echo "罗马尼亚" ;;
+        RS) echo "塞尔维亚" ;;
+        SE) echo "瑞典" ;;
+        SK) echo "斯洛伐克" ;;
+        AUTO) echo "自动" ;;
+        *) echo "$cc" ;;
+    esac
+}
+
+# 出口 IP 检测 (等价 psictl egress-test)
+psiphon_egress_test() {
+    local socks
+    socks="$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null)"
+    socks="${socks:-2080}"
+
+    yellow "[*] 正在检测 Psiphon 出口 IP..."
+    
+    # 检查 Psiphon 是否在运行
+    if ! pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1; then
+        red "[!] Psiphon 未运行"
+        return 1
+    fi
+
+    local json
+    # 尝试 ipinfo.io
+    json="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" https://ipinfo.io/json 2>/dev/null || true)"
+    
+    # fallback 到 ip-api.com
+    if [[ -z "$json" ]]; then
+        yellow "[*] ipinfo.io 失败，尝试 ip-api.com..."
+        json="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" http://ip-api.com/json 2>/dev/null || true)"
+    fi
+
+    if [[ -z "$json" ]]; then
+        red "[!] FAIL: SOCKS 不通 (127.0.0.1:${socks})"
+        return 1
+    fi
+
+    # 解析 JSON
+    python3 - <<PY
+import json
+import sys
+
+raw = '''$json'''
+try:
+    j = json.loads(raw)
+    ip = j.get('ip') or j.get('query') or ''
+    country = j.get('country') or j.get('countryCode') or ''
+    org = j.get('org') or j.get('isp') or ''
+    city = j.get('city') or ''
+    region = j.get('region') or j.get('regionName') or ''
+    
+    print(f"  IP:      {ip}")
+    print(f"  国家:    {country}")
+    print(f"  城市:    {city}")
+    print(f"  地区:    {region}")
+    print(f"  运营商:  {org}")
+except Exception as e:
+    print(f"[!] 解析失败: {e}")
+    sys.exit(1)
+PY
+    
+    return 0
+}
+
+# 设置出口国家
+psiphon_set_region() {
+    local cc="${1:-AUTO}"
+    [[ -z "$cc" ]] && cc="AUTO"
+    cc="${cc^^}"
+    
+    local name=$(get_country_name "$cc")
+    yellow "[*] 切换 Psiphon 出口国家: $cc ($name)..."
+    
+    echo "$cc" > "$WORKDIR/psiphon_region.txt"
+    
+    # 重启 Psiphon
+    start_psiphon_userland
+    
+    if [ $? -eq 0 ]; then
+        green "[+] 已切换到 $cc ($name)"
+        # 等待连接建立
+        sleep 3
+        psiphon_egress_test || true
+    else
+        red "[!] 切换失败"
+        return 1
+    fi
+}
+
+# 国家可用性检测
+psiphon_country_test() {
+    local list=("$@")
+    [[ ${#list[@]} -ge 1 ]] || { red "用法: psiphon_country_test US JP SG ..."; return 1; }
+
+    local ok=() fail=() mismatch=()
+    local socks
+    socks="$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null)"
+    socks="${socks:-2080}"
+
+    for cc in "${list[@]}"; do
+        cc="${cc^^}"
+        local name=$(get_country_name "$cc")
+        yellow "==> 测试 $cc ($name)"
+        
+        # 切换国家
+        echo "$cc" > "$WORKDIR/psiphon_region.txt"
+        start_psiphon_userland >/dev/null 2>&1 || { 
+            red "  [-] FAIL (启动失败)"
+            fail+=("$cc")
+            continue
+        }
+        
+        # 等待连接
+        sleep 4
+
+        # 查出口 country
+        local json got
+        json="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" https://ipinfo.io/json 2>/dev/null || true)"
+        
+        if [[ -z "$json" ]]; then
+            json="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" http://ip-api.com/json 2>/dev/null || true)"
+        fi
+
+        if [[ -z "$json" ]]; then
+            red "  [-] FAIL (无响应)"
+            fail+=("$cc")
+            continue
+        fi
+
+        got="$(python3 - <<PY
+import json
+import sys
+raw = '''$json'''
+try:
+    j = json.loads(raw)
+    c = j.get("country") or j.get("countryCode") or ""
+    print(c.upper())
+except:
+    print("")
+PY
+)"
+
+        if [[ -z "$got" ]]; then
+            yellow "  [~] MISMATCH (无 country 字段)"
+            mismatch+=("$cc")
+        elif [[ "$got" == "$cc" ]]; then
+            green "  [+] OK (出口=$got)"
+            ok+=("$cc")
+        else
+            yellow "  [~] MISMATCH (期望=$cc 实际=$got)"
+            mismatch+=("$cc")
+        fi
+    done
+
+    echo
+    blue "========== 测试结果 =========="
+    green "OK:       ${ok[*]:-无}"
+    red "FAIL:     ${fail[*]:-无}"
+    yellow "MISMATCH: ${mismatch[*]:-无}"
+    echo "=============================="
+    
+    # 保存 OK 列表供智能切换使用
+    printf '%s\n' "${ok[@]}" > "$WORKDIR/psiphon_ok_countries.txt" 2>/dev/null
+}
+
+# 测试所有常用国家
+psiphon_country_test_all() {
+    yellow "[*] 开始测试所有常用国家 (共 ${#PSI_ALL_CC[@]} 个)..."
+    yellow "[*] 这可能需要几分钟，请耐心等待..."
+    echo
+    psiphon_country_test "${PSI_ALL_CC[@]}"
+}
+
+# 智能切换出口国家
+psiphon_smart_country() {
+    echo
+    green "==== Psiphon 智能切换出口国家 ===="
+    echo
+    
+    # 检查是否有缓存的 OK 列表
+    local ok_file="$WORKDIR/psiphon_ok_countries.txt"
+    local ok_arr=()
+    
+    if [[ -f "$ok_file" ]] && [[ -s "$ok_file" ]]; then
+        mapfile -t ok_arr < "$ok_file"
+        if [[ ${#ok_arr[@]} -gt 0 ]]; then
+            echo
+            yellow "检测到上次测试结果 (${#ok_arr[@]} 个可用国家)"
+            yellow "选项:"
+            yellow "  1. 使用上次结果"
+            yellow "  2. 重新测试常用国家"
+            yellow "  3. 快速测试 (仅 US/JP/SG/HK)"
+            yellow "  0. 返回"
+            reading "请选择: " test_choice
+            
+            case "$test_choice" in
+                1) ;;  # 使用缓存
+                2) 
+                    psiphon_country_test_all
+                    mapfile -t ok_arr < "$ok_file"
+                    ;;
+                3)
+                    psiphon_country_test US JP SG HK
+                    mapfile -t ok_arr < "$ok_file"
+                    ;;
+                0|*) return 0 ;;
+            esac
+        fi
+    else
+        yellow "未检测到可用国家列表，需要先测试"
+        yellow "选项:"
+        yellow "  1. 测试所有常用国家"
+        yellow "  2. 快速测试 (仅 US/JP/SG/HK)"
+        yellow "  0. 返回"
+        reading "请选择: " test_choice
+        
+        case "$test_choice" in
+            1) 
+                psiphon_country_test_all
+                mapfile -t ok_arr < "$ok_file"
+                ;;
+            2)
+                psiphon_country_test US JP SG HK
+                mapfile -t ok_arr < "$ok_file"
+                ;;
+            0|*) return 0 ;;
+        esac
+    fi
+
+    if [[ ${#ok_arr[@]} -eq 0 ]]; then
+        red "[!] 没有检测到可用国家"
+        return 1
+    fi
+
+    echo
+    green "========== 可用国家 =========="
+    local i=1
+    for cc in "${ok_arr[@]}"; do
+        local name=$(get_country_name "$cc")
+        printf "  %2d) %-4s %s\n" "$i" "$cc" "$name"
+        ((i++))
+    done
+    echo "   0) 取消"
+    echo "   A) AUTO (自动选择)"
+    echo "=============================="
+    reading "请选择编号或国家码: " sel
+
+    if [[ "${sel^^}" == "A" || "${sel^^}" == "AUTO" ]]; then
+        psiphon_set_region AUTO
+        return 0
+    fi
+
+    if [[ "$sel" =~ ^[0-9]+$ ]]; then
+        [[ "$sel" -eq 0 ]] && return 0
+        local idx=$((sel-1))
+        if [[ $idx -ge 0 && $idx -lt ${#ok_arr[@]} ]]; then
+            psiphon_set_region "${ok_arr[$idx]}"
+        else
+            red "[!] 编号超出范围"
+        fi
+    else
+        psiphon_set_region "${sel^^}"
+    fi
+}
+
+# Psiphon 管理菜单 (psictl 等价)
+psiphon_management_menu() {
+    while true; do
+        clear
+        echo
+        green "============================================================"
+        green "  Psiphon 赛风管理 (psictl 等价功能)"
+        green "============================================================"
+        echo
+        
+        # 显示当前状态
+        local psi_enabled=$(cat "$WORKDIR/psiphon_enabled.txt" 2>/dev/null)
+        local psi_region=$(cat "$WORKDIR/psiphon_region.txt" 2>/dev/null)
+        local psi_socks=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null)
+        psi_region="${psi_region:-AUTO}"
+        psi_socks="${psi_socks:-2080}"
+        
+        if [[ "$psi_enabled" == "true" ]]; then
+            local region_name=$(get_country_name "$psi_region")
+            if pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1; then
+                green "状态:     ✓ 已启用并运行中"
+            else
+                yellow "状态:     ⚠ 已启用但未运行"
+            fi
+            blue "出口国家: $psi_region ($region_name)"
+            blue "SOCKS端口: 127.0.0.1:$psi_socks"
+        else
+            yellow "状态:     ✗ 未启用"
+        fi
+        
+        echo
+        echo "------------------------------------------------------------"
+        green "  1. 查看当前出口 IP"
+        green "  2. 智能切换出口国家"
+        green "  3. 手动切换出口国家"
+        echo "  ------------"
+        yellow "  4. 快速测试国家 (US/JP/SG/HK)"
+        yellow "  5. 测试所有常用国家"
+        yellow "  6. 自定义测试国家"
+        echo "  ------------"
+        blue "  7. 查看 Psiphon 日志"
+        blue "  8. 重启 Psiphon"
+        echo "  ------------"
+        red "  0. 返回主菜单"
+        echo "============================================================"
+        reading "请选择 [0-8]: " choice
+        echo
+        
+        case "$choice" in
+            1)
+                psiphon_egress_test
+                ;;
+            2)
+                psiphon_smart_country
+                ;;
+            3)
+                echo
+                green "常用国家码:"
+                yellow "  US=美国 JP=日本 SG=新加坡 HK=香港 TW=台湾"
+                yellow "  KR=韩国 GB=英国 DE=德国 FR=法国 NL=荷兰"
+                yellow "  CA=加拿大 AU=澳大利亚 AUTO=自动"
+                echo
+                reading "请输入国家码 (如 US): " new_cc
+                [[ -n "$new_cc" ]] && psiphon_set_region "$new_cc"
+                ;;
+            4)
+                psiphon_country_test US JP SG HK
+                ;;
+            5)
+                psiphon_country_test_all
+                ;;
+            6)
+                echo
+                yellow "请输入要测试的国家码 (空格分隔):"
+                yellow "例如: US JP SG HK TW KR"
+                reading "> " custom_list
+                if [[ -n "$custom_list" ]]; then
+                    read -r -a cc_arr <<< "$custom_list"
+                    psiphon_country_test "${cc_arr[@]}"
+                fi
+                ;;
+            7)
+                echo
+                green "========== Psiphon 日志 (最近 30 行) =========="
+                tail -30 "$WORKDIR/psiphon.log" 2>/dev/null || yellow "日志为空"
+                echo "================================================"
+                ;;
+            8)
+                yellow "正在重启 Psiphon..."
+                start_psiphon_userland && green "重启成功" || red "重启失败"
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                red "无效选项"
+                ;;
+        esac
+        
+        echo
+        reading "按回车继续..." _
+    done
 }
 
 # ==================== 下载函数 ====================
@@ -3133,8 +3917,19 @@ configure_warp_outbound() {
         yellow "当前状态: WARP 未启用 (直连)"
     fi
     
+    # 显示 Psiphon 状态
+    local psi_status=$(cat "$WORKDIR/psiphon_enabled.txt" 2>/dev/null)
+    local psi_mode=$(cat "$WORKDIR/psiphon_mode.txt" 2>/dev/null)
+    if [[ "$psi_status" == "true" ]]; then
+        if [[ "$psi_mode" == "all" ]]; then
+            purple "Psiphon: ✓ 已启用 (全部流量)"
+        else
+            purple "Psiphon: ✓ 已启用 (分流模式)"
+        fi
+    fi
+    
     echo
-    yellow "选择操作:"
+    yellow "===== WARP 出站 ====="
     yellow "  0. 不使用 WARP (直连)"
     yellow "  1. 全部流量走 WARP"
     yellow "  2. 仅 Google/YouTube 走 WARP (分流)"
@@ -3142,9 +3937,14 @@ configure_warp_outbound() {
     green "  3. 优选 Endpoint IP (优化连接质量)"
     blue "  4. 恢复 Cloudflare 默认 Endpoint"
     blue "  5. 重新获取勇哥API配置"
+    echo
+    purple "===== Psiphon 出站 ====="
+    purple "  6. Psiphon 全局出站"
+    purple "  7. Psiphon 分流出站 (Google/OpenAI/Netflix)"
+    purple "  8. 关闭 Psiphon"
     echo "  -------------"
     yellow "  9. 返回主菜单"
-    reading "请选择 [0-5/9]: " new_choice
+    reading "请选择 [0-9]: " new_choice
     
     if [[ "$new_choice" == "9" ]]; then
         return 0
@@ -3294,7 +4094,95 @@ configure_warp_outbound() {
             WARP_MODE=""
             echo "false" > "$WORKDIR/warp_enabled.txt"
             echo "" > "$WORKDIR/warp_mode.txt"
-            green "已选择: 直连 (不使用 WARP)"
+            # 同时关闭 Psiphon
+            stop_psiphon_userland
+            echo "false" > "$WORKDIR/psiphon_enabled.txt"
+            green "已选择: 直连 (不使用 WARP/Psiphon)"
+            ;;
+        6)
+            # Psiphon 全局出站
+            yellow "正在配置 Psiphon 全局出站..."
+            # 关闭 WARP
+            WARP_ENABLED=false
+            echo "false" > "$WORKDIR/warp_enabled.txt"
+            echo "" > "$WORKDIR/warp_mode.txt"
+            
+            if apply_egress_mode_psiphon "all"; then
+                echo "true" > "$WORKDIR/psiphon_enabled.txt"
+                echo "all" > "$WORKDIR/psiphon_mode.txt"
+                
+                # 重启 sing-box
+                local sb_binary=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
+                if [ -n "$sb_binary" ]; then
+                    yellow "正在重启 sing-box..."
+                    pkill -f "run -c config.json" >/dev/null 2>&1
+                    sleep 1
+                    nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
+                    sleep 2
+                    if pgrep -x "$sb_binary" > /dev/null; then
+                        green "✓ Psiphon 全局出站已启用"
+                    else
+                        red "sing-box 重启失败"
+                    fi
+                fi
+            else
+                red "Psiphon 配置失败"
+            fi
+            return 0
+            ;;
+        7)
+            # Psiphon 分流出站
+            yellow "正在配置 Psiphon 分流出站..."
+            # 关闭 WARP
+            WARP_ENABLED=false
+            echo "false" > "$WORKDIR/warp_enabled.txt"
+            echo "" > "$WORKDIR/warp_mode.txt"
+            
+            if apply_egress_mode_psiphon "google"; then
+                echo "true" > "$WORKDIR/psiphon_enabled.txt"
+                echo "google" > "$WORKDIR/psiphon_mode.txt"
+                
+                # 重启 sing-box
+                local sb_binary=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
+                if [ -n "$sb_binary" ]; then
+                    yellow "正在重启 sing-box..."
+                    pkill -f "run -c config.json" >/dev/null 2>&1
+                    sleep 1
+                    nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
+                    sleep 2
+                    if pgrep -x "$sb_binary" > /dev/null; then
+                        green "✓ Psiphon 分流出站已启用 (Google/OpenAI/Netflix)"
+                    else
+                        red "sing-box 重启失败"
+                    fi
+                fi
+            else
+                red "Psiphon 配置失败"
+            fi
+            return 0
+            ;;
+        8)
+            # 关闭 Psiphon
+            yellow "正在关闭 Psiphon..."
+            if disable_psiphon_egress; then
+                # 重启 sing-box
+                local sb_binary=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
+                if [ -n "$sb_binary" ]; then
+                    yellow "正在重启 sing-box..."
+                    pkill -f "run -c config.json" >/dev/null 2>&1
+                    sleep 1
+                    nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
+                    sleep 2
+                    if pgrep -x "$sb_binary" > /dev/null; then
+                        green "✓ Psiphon 已关闭，恢复直连"
+                    else
+                        red "sing-box 重启失败"
+                    fi
+                fi
+            else
+                red "关闭 Psiphon 失败"
+            fi
+            return 0
             ;;
         *)
             red "无效选项"
@@ -3570,6 +4458,17 @@ menu() {
         else
             purple "WARP: ✗ 未启用"
         fi
+        
+        # 显示 Psiphon 状态
+        local psi_status=$(cat "$WORKDIR/psiphon_enabled.txt" 2>/dev/null)
+        local psi_mode=$(cat "$WORKDIR/psiphon_mode.txt" 2>/dev/null)
+        if [[ "$psi_status" == "true" ]]; then
+            if [[ "$psi_mode" == "all" ]]; then
+                purple "Psiphon: ✓ 已启用 (全部流量)"
+            else
+                purple "Psiphon: ✓ 已启用 (分流模式)"
+            fi
+        fi
     else
         yellow "状态: ✗ 未安装"
     fi
@@ -3592,14 +4491,16 @@ menu() {
     echo "------------------------------------------------------------"
     blue "  8. 查看运行日志"
     echo "------------------------------------------------------------"
-    blue "  9. 配置WARP出站"
+    blue "  9. 配置WARP/Psiphon出站"
+    echo "------------------------------------------------------------"
+    purple " 11. Psiphon 管理 (国家切换/出口检测)"
     echo "------------------------------------------------------------"
     red " 10. 系统初始化清理"
     echo "------------------------------------------------------------"
     red "  0. 退出"
     echo "============================================================"
     
-    reading "请选择 [0-10]: " choice
+    reading "请选择 [0-11]: " choice
     echo
     
     case "$choice" in
@@ -3615,12 +4516,20 @@ menu() {
         10) 
             reading "确定清理所有内容? (y/N): " confirm
             if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                stop_all
+                # 停止所有服务
+                stop_psiphon_userland
+                SB_BINARY=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
+                [ -n "$SB_BINARY" ] && pkill -x "$SB_BINARY" 2>/dev/null
+                CF_BINARY=$(cat "$WORKDIR/cf.txt" 2>/dev/null)
+                [ -n "$CF_BINARY" ] && pkill -x "$CF_BINARY" 2>/dev/null
+                NZ_BINARY=$(cat "$WORKDIR/nz.txt" 2>/dev/null)
+                [ -n "$NZ_BINARY" ] && pkill -x "$NZ_BINARY" 2>/dev/null
                 rm -rf "$HOME/domains"
                 find "$HOME" -maxdepth 1 -type f -name "*.sh" -exec rm -f {} \;
                 green "系统已重置"
             fi
             ;;
+        11) psiphon_management_menu ;;
         0) exit 0 ;;
         *) red "无效选项" ;;
     esac
