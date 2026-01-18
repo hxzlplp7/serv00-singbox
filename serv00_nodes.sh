@@ -2667,6 +2667,12 @@ sync_egress_group_to_singbox() {
         return 1
     fi
     
+    # 确保 ALL_IPS 已加载
+    if [[ -f "$WORKDIR/all_ips.txt" ]]; then
+        mapfile -t ALL_IPS < "$WORKDIR/all_ips.txt"
+    fi
+    [[ ${#ALL_IPS[@]} -eq 0 ]] && ALL_IPS=("$HOSTNAME")
+    
     # 备份
     cp "$cfg" "$cfg.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null
     
@@ -2675,6 +2681,9 @@ sync_egress_group_to_singbox() {
     local reality_private=$(cat "$WORKDIR/private_key.txt" 2>/dev/null)
     local reality_domain=$(cat "$WORKDIR/reym.txt" 2>/dev/null)
     local server_ip="${ALL_IPS[0]:-$HOSTNAME}"
+    
+    # 把 IP 列表拼成逗号串传给 Python
+    local ip_csv="$(printf "%s," "${ALL_IPS[@]}")"; ip_csv="${ip_csv%,}"
     
     python3 - <<PY
 import json
@@ -2691,6 +2700,12 @@ uuid = r"$uuid"
 reality_private = r"$reality_private"
 reality_domain = r"$reality_domain"
 server_ip = r"$server_ip"
+
+# 解析 IP 列表
+ip_csv = r"$ip_csv"
+ips = [x.strip() for x in ip_csv.split(",") if x.strip()]
+if not ips:
+    ips = [server_ip]
 
 try:
     with open(cfg_path, "r", encoding="utf-8") as f:
@@ -2728,7 +2743,7 @@ else:
 
 inbound_tags = []
 
-# 2. 添加 VLESS inbound
+# 2. 添加 VLESS inbound (TCP 协议用 :: 监听即可)
 if vless_port > 0:
     vless_tag = f"vless-reality-{cc_lower}"
     inbound_tags.append(vless_tag)
@@ -2754,48 +2769,54 @@ if vless_port > 0:
         }
     })
 
-# 3. 添加 Hysteria2 inbound
-if hy2_port > 0:
-    hy2_tag = f"hysteria2-{cc_lower}"
-    inbound_tags.append(hy2_tag)
-    
-    inbounds[:] = [i for i in inbounds if i.get("tag") != hy2_tag]
-    
-    inbounds.append({
-        "type": "hysteria2",
-        "tag": hy2_tag,
-        "listen": "::",
-        "listen_port": hy2_port,
-        "users": [{"password": uuid}],
-        "tls": {
-            "enabled": True,
-            "alpn": ["h3"],
-            "certificate_path": "cert.pem",
-            "key_path": "private.key"
-        }
-    })
+# 3. 添加 Hysteria2 inbound（每个 IP 一个 inbound，像 serv00.sh 那样）
+if hy2_port > 0 and ips:
+    # 先移除旧的 hysteria2-*-{cc_lower} 格式的 inbound
+    inbounds[:] = [i for i in inbounds 
+                   if not (i.get("tag", "").startswith("hysteria2-") and i.get("tag", "").endswith(f"-{cc_lower}"))]
 
-# 4. 添加 TUIC inbound
-if tuic_port > 0:
-    tuic_tag = f"tuic-{cc_lower}"
-    inbound_tags.append(tuic_tag)
-    
-    inbounds[:] = [i for i in inbounds if i.get("tag") != tuic_tag]
-    
-    inbounds.append({
-        "type": "tuic",
-        "tag": tuic_tag,
-        "listen": "::",
-        "listen_port": tuic_port,
-        "users": [{"uuid": uuid, "password": uuid}],
-        "congestion_control": "bbr",
-        "tls": {
-            "enabled": True,
-            "alpn": ["h3"],
-            "certificate_path": "cert.pem",
-            "key_path": "private.key"
-        }
-    })
+    for idx, ip in enumerate(ips, start=1):
+        hy2_tag = f"hysteria2-{idx}-{cc_lower}"
+        inbound_tags.append(hy2_tag)
+
+        inbounds.append({
+            "type": "hysteria2",
+            "tag": hy2_tag,
+            "listen": ip,              # 关键：绑定到具体 IP
+            "listen_port": hy2_port,
+            "users": [{"password": uuid}],
+            "tls": {
+                "enabled": True,
+                "alpn": ["h3"],
+                "certificate_path": "cert.pem",
+                "key_path": "private.key"
+            }
+        })
+
+# 4. 添加 TUIC inbound（每个 IP 一个 inbound）
+if tuic_port > 0 and ips:
+    # 先移除旧的 tuic-*-{cc_lower} 格式的 inbound
+    inbounds[:] = [i for i in inbounds 
+                   if not (i.get("tag", "").startswith("tuic-") and i.get("tag", "").endswith(f"-{cc_lower}"))]
+
+    for idx, ip in enumerate(ips, start=1):
+        tuic_tag = f"tuic-{idx}-{cc_lower}"
+        inbound_tags.append(tuic_tag)
+
+        inbounds.append({
+            "type": "tuic",
+            "tag": tuic_tag,
+            "listen": ip,              # 关键：绑定到具体 IP
+            "listen_port": tuic_port,
+            "users": [{"uuid": uuid, "password": uuid}],
+            "congestion_control": "bbr",
+            "tls": {
+                "enabled": True,
+                "alpn": ["h3"],
+                "certificate_path": "cert.pem",
+                "key_path": "private.key"
+            }
+        })
 
 # 5. 添加路由规则
 rule_exists = False
@@ -2814,7 +2835,7 @@ if not rule_exists and inbound_tags:
 try:
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    print(f"[+] sing-box 配置已更新 ({cc} 节点组)")
+    print(f"[+] sing-box 配置已更新 ({cc} 节点组, {len(ips)} 个IP)")
 except Exception as e:
     print(f"[!] 写入配置失败: {e}")
     sys.exit(1)
