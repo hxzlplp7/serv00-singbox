@@ -92,6 +92,37 @@ SCRIPT_VERSION="1.0.0"
 
 # ==================== 工具函数 ====================
 
+# 后台脱离终端启动函数 (支持 setsid/daemon/nohup 降级)
+# 用法: run_detached <pidfile> <logfile> <cmd...>
+run_detached() {
+    local pidfile="$1"; shift
+    local logfile="$1"; shift
+
+    # 优先使用 setsid (Linux)
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$@" </dev/null >>"$logfile" 2>&1 &
+        echo $! >"$pidfile"
+        return 0
+    fi
+
+    # FreeBSD 使用 daemon 命令
+    if command -v daemon >/dev/null 2>&1; then
+        # daemon 会脱离控制终端，并把子进程 pid 写到 pidfile
+        local cmd=""
+        for arg in "$@"; do
+            cmd+=" $(printf "%q" "$arg")"
+        done
+        /usr/sbin/daemon -p "$pidfile" /bin/sh -c "exec $cmd </dev/null >>\"$logfile\" 2>&1"
+        return $?
+    fi
+
+    # 最后的兜底 (不如 setsid/daemon 可靠)
+    nohup "$@" </dev/null >>"$logfile" 2>&1 &
+    echo $! >"$pidfile"
+    return 0
+}
+
+
 # 初始化目录
 init_directories() {
     devil www add ${USERNAME}.${DOMAIN} php > /dev/null 2>&1
@@ -826,7 +857,8 @@ optimize_warp_endpoint() {
         yellow "可能原因: 网络不通或防火墙阻止UDP"
         # 恢复服务
         if $warp_running && [ -n "$sb_binary" ] && [ -f "$sb_binary" ]; then
-            setsid ./"$sb_binary" run -c config.json </dev/null >>"$WORKDIR/singbox.log" 2>&1 &
+            run_detached "$WORKDIR/singbox.pid" "$WORKDIR/singbox.log" \
+                ./"$sb_binary" run -c config.json
             green "已恢复 sing-box 服务"
         fi
         return 1
@@ -1359,9 +1391,11 @@ start_psiphon_userland() {
 
     yellow "[*] 启动 Psiphon (SOCKS: 自动端口 127.0.0.1:0)..."
     cd "$WORKDIR"
-    setsid "$bin" -config "$WORKDIR/psiphon.config" </dev/null >>"$WORKDIR/psiphon.log" 2>&1 &
-    local pid=$!
-    echo "$pid" > "$WORKDIR/psiphon.pid"
+    run_detached "$WORKDIR/psiphon.pid" "$WORKDIR/psiphon.log" \
+        "$bin" -config "$WORKDIR/psiphon.config"
+    
+    local pid
+    pid="$(cat "$WORKDIR/psiphon.pid" 2>/dev/null || echo 0)"
     
     # 给进程一点启动时间
     sleep 2
@@ -1424,7 +1458,8 @@ start_singbox_safe() {
 
     # 启动（使用绝对路径）
     cd "$WORKDIR"
-    setsid "$WORKDIR/$SB_BINARY" run -c "$WORKDIR/config.json" </dev/null >> "$WORKDIR/singbox.log" 2>&1 &
+    run_detached "$WORKDIR/singbox.pid" "$WORKDIR/singbox.log" \
+        "$WORKDIR/$SB_BINARY" run -c "$WORKDIR/config.json"
     sleep 2
 
     if pgrep -f "$WORKDIR/$SB_BINARY" >/dev/null 2>&1 || pgrep -x "$SB_BINARY" >/dev/null 2>&1; then
@@ -2316,9 +2351,11 @@ start_psiphon_instance() {
     yellow "[*] 启动 Psiphon $cc 实例..."
     
     cd "$instance_dir"
-    setsid "$bin" -config "$instance_dir/psiphon.config" </dev/null >> "$instance_dir/psiphon.log" 2>&1 &
-    local pid=$!
-    echo "$pid" > "$instance_dir/psiphon.pid"
+    run_detached "$instance_dir/psiphon.pid" "$instance_dir/psiphon.log" \
+        "$bin" -config "$instance_dir/psiphon.config"
+    
+    local pid
+    pid="$(cat "$instance_dir/psiphon.pid" 2>/dev/null || echo 0)"
     
     sleep 2
     
@@ -5650,7 +5687,8 @@ CONFIG_EOF
         pkill -f "run -c config.json" >/dev/null 2>&1
         sleep 1
         
-        setsid ./"$SB_BINARY" run -c config.json </dev/null >> "$WORKDIR/singbox.log" 2>&1 &
+        run_detached "$WORKDIR/singbox.pid" "$WORKDIR/singbox.log" \
+            ./"$SB_BINARY" run -c config.json
         sleep 2
         
         if pgrep -x "$SB_BINARY" > /dev/null; then
