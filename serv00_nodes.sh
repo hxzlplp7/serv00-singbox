@@ -2085,7 +2085,7 @@ psiphon_management_menu() {
         blue "  7. 查看 Psiphon 日志"
         blue "  8. 重启 Psiphon"
         echo "  ------------"
-        purple "  9. ➕ 多出口节点组管理 (添加不同国家出口的节点)"
+        purple "  9. 多出口节点组管理"
         echo "  ------------"
         red "  0. 返回主菜单"
         echo "============================================================"
@@ -2102,8 +2102,8 @@ psiphon_management_menu() {
             3)
                 echo
                 green "常用国家码:"
-                yellow "  US=美国 JP=日本 SG=新加坡 HK=香港 TW=台湾"
-                yellow "  KR=韩国 GB=英国 DE=德国 FR=法国 NL=荷兰"
+                yellow "  US=美国 JP=日本 SG=新加坡 "
+                yellow "  GB=英国 DE=德国 FR=法国 NL=荷兰"
                 yellow "  CA=加拿大 AU=澳大利亚 AUTO=自动"
                 echo
                 reading "请输入国家码 (如 US): " new_cc
@@ -2821,48 +2821,71 @@ except Exception as e:
 PY
 }
 
-# 生成出口节点组链接
+# 生成出口节点组链接（展开全部 IP + 自定义命名）
 generate_egress_node_links() {
     local cc="${1^^}"
     local cc_lower=$(echo "$cc" | tr '[:upper:]' '[:lower:]')
     local name=$(get_country_name "$cc")
-    
+
     local vless_port=$(cat "$PSI_INSTANCES_DIR/$cc/vless_port.txt" 2>/dev/null)
     local hy2_port=$(cat "$PSI_INSTANCES_DIR/$cc/hy2_port.txt" 2>/dev/null)
     local tuic_port=$(cat "$PSI_INSTANCES_DIR/$cc/tuic_port.txt" 2>/dev/null)
-    
+
     local uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null)
     local reality_public=$(cat "$WORKDIR/public_key.txt" 2>/dev/null)
     local reality_domain=$(cat "$WORKDIR/reym.txt" 2>/dev/null)
-    local server_ip="${ALL_IPS[0]:-$HOSTNAME}"
-    
+
+    # 确保 ALL_IPS 已加载（多出口菜单路径下不一定提前加载）
+    if [[ -f "$WORKDIR/all_ips.txt" ]]; then
+        mapfile -t ALL_IPS < "$WORKDIR/all_ips.txt"
+    fi
+    [[ ${#ALL_IPS[@]} -eq 0 ]] && ALL_IPS=("$HOSTNAME")
+
+    # 中转标签（可改为自动识别落地国家）
+    local transit_label="PL中转"
+
     echo
     green "========== $cc ($name) 出口节点链接 =========="
-    
-    # VLESS-Reality
+
+    # VLESS-Reality：为每个IP输出一条
     if [[ -n "$vless_port" && "$vless_port" != "0" ]]; then
-        local vless_link="vless://${uuid}@${server_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reality_domain}&fp=chrome&pbk=${reality_public}&type=tcp#VLESS-Reality-${cc}"
         echo
-        purple "VLESS-Reality-$cc:"
-        echo "$vless_link"
+        purple "VLESS-Reality-$cc (共 ${#ALL_IPS[@]} 个IP):"
+        local idx=1
+        for ip in "${ALL_IPS[@]}"; do
+            local node_name="${cc}-VLESS-${transit_label}-${idx}"
+            local vless_link="vless://${uuid}@${ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reality_domain}&fp=chrome&pbk=${reality_public}&type=tcp#${node_name}"
+            echo "$vless_link"
+            ((idx++))
+        done
     fi
-    
-    # Hysteria2
+
+    # Hysteria2：为每个IP输出一条
     if [[ -n "$hy2_port" && "$hy2_port" != "0" ]]; then
-        local hy2_link="hysteria2://${uuid}@${server_ip}:${hy2_port}?insecure=1&sni=${server_ip}#Hysteria2-${cc}"
         echo
-        purple "Hysteria2-$cc:"
-        echo "$hy2_link"
+        purple "Hysteria2-$cc (共 ${#ALL_IPS[@]} 个IP):"
+        local idx=1
+        for ip in "${ALL_IPS[@]}"; do
+            local node_name="${cc}-Hysteria2-${transit_label}-${idx}"
+            local hy2_link="hysteria2://${uuid}@${ip}:${hy2_port}?insecure=1&sni=${HOSTNAME}#${node_name}"
+            echo "$hy2_link"
+            ((idx++))
+        done
     fi
-    
-    # TUIC
+
+    # TUIC：如果端口申请成功，也为每个IP输出一条
     if [[ -n "$tuic_port" && "$tuic_port" != "0" ]]; then
-        local tuic_link="tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?congestion_control=bbr&alpn=h3&allow_insecure=1#TUIC-${cc}"
         echo
-        purple "TUIC-$cc:"
-        echo "$tuic_link"
+        purple "TUIC-$cc (共 ${#ALL_IPS[@]} 个IP):"
+        local idx=1
+        for ip in "${ALL_IPS[@]}"; do
+            local node_name="${cc}-TUIC-${transit_label}-${idx}"
+            local tuic_link="tuic://${uuid}:${uuid}@${ip}:${tuic_port}?congestion_control=bbr&alpn=h3&allow_insecure=1#${node_name}"
+            echo "$tuic_link"
+            ((idx++))
+        done
     fi
-    
+
     echo "============================================="
 }
 
