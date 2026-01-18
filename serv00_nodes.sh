@@ -826,7 +826,7 @@ optimize_warp_endpoint() {
         yellow "可能原因: 网络不通或防火墙阻止UDP"
         # 恢复服务
         if $warp_running && [ -n "$sb_binary" ] && [ -f "$sb_binary" ]; then
-            nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
+            setsid ./"$sb_binary" run -c config.json </dev/null >>"$WORKDIR/singbox.log" 2>&1 &
             green "已恢复 sing-box 服务"
         fi
         return 1
@@ -1359,7 +1359,7 @@ start_psiphon_userland() {
 
     yellow "[*] 启动 Psiphon (SOCKS: 自动端口 127.0.0.1:0)..."
     cd "$WORKDIR"
-    nohup "$bin" -config "$WORKDIR/psiphon.config" >>"$WORKDIR/psiphon.log" 2>&1 &
+    setsid "$bin" -config "$WORKDIR/psiphon.config" </dev/null >>"$WORKDIR/psiphon.log" 2>&1 &
     local pid=$!
     echo "$pid" > "$WORKDIR/psiphon.pid"
     
@@ -1424,7 +1424,7 @@ start_singbox_safe() {
 
     # 启动（使用绝对路径）
     cd "$WORKDIR"
-    nohup "$WORKDIR/$SB_BINARY" run -c "$WORKDIR/config.json" >> "$WORKDIR/singbox.log" 2>&1 &
+    setsid "$WORKDIR/$SB_BINARY" run -c "$WORKDIR/config.json" </dev/null >> "$WORKDIR/singbox.log" 2>&1 &
     sleep 2
 
     if pgrep -f "$WORKDIR/$SB_BINARY" >/dev/null 2>&1 || pgrep -x "$SB_BINARY" >/dev/null 2>&1; then
@@ -2316,7 +2316,7 @@ start_psiphon_instance() {
     yellow "[*] 启动 Psiphon $cc 实例..."
     
     cd "$instance_dir"
-    nohup "$bin" -config "$instance_dir/psiphon.config" >> "$instance_dir/psiphon.log" 2>&1 &
+    setsid "$bin" -config "$instance_dir/psiphon.config" </dev/null >> "$instance_dir/psiphon.log" 2>&1 &
     local pid=$!
     echo "$pid" > "$instance_dir/psiphon.pid"
     
@@ -5650,7 +5650,7 @@ CONFIG_EOF
         pkill -f "run -c config.json" >/dev/null 2>&1
         sleep 1
         
-        nohup ./"$SB_BINARY" run -c config.json >> "$WORKDIR/singbox.log" 2>&1 &
+        setsid ./"$SB_BINARY" run -c config.json </dev/null >> "$WORKDIR/singbox.log" 2>&1 &
         sleep 2
         
         if pgrep -x "$SB_BINARY" > /dev/null; then
