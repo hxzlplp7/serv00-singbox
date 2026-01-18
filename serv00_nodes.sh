@@ -2085,9 +2085,11 @@ psiphon_management_menu() {
         blue "  7. 查看 Psiphon 日志"
         blue "  8. 重启 Psiphon"
         echo "  ------------"
+        purple "  9. ➕ 多出口节点组管理 (添加不同国家出口的节点)"
+        echo "  ------------"
         red "  0. 返回主菜单"
         echo "============================================================"
-        reading "请选择 [0-8]: " choice
+        reading "请选择 [0-9]: " choice
         echo
         
         case "$choice" in
@@ -2138,6 +2140,909 @@ psiphon_management_menu() {
                 else
                     red "Psiphon 重启失败"
                 fi
+                ;;
+            9)
+                multi_egress_menu
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                red "无效选项"
+                ;;
+        esac
+        
+        echo
+        reading "按回车继续..." _
+    done
+}
+
+# ==================== Psiphon 多出口实例管理 ====================
+
+# 多实例目录
+PSI_INSTANCES_DIR="$WORKDIR/psiphon_instances"
+
+# 初始化多实例目录结构
+init_psiphon_instances_dir() {
+    mkdir -p "$PSI_INSTANCES_DIR" 2>/dev/null
+    touch "$PSI_INSTANCES_DIR/instances.txt" 2>/dev/null
+}
+
+# 获取所有实例列表
+get_all_instances() {
+    if [[ -f "$PSI_INSTANCES_DIR/instances.txt" ]]; then
+        cat "$PSI_INSTANCES_DIR/instances.txt" | tr ',' '\n' | grep -v '^$' | sort -u
+    fi
+}
+
+# 检查实例是否存在
+instance_exists() {
+    local cc="${1^^}"
+    get_all_instances | grep -qxF "$cc"
+}
+
+# 获取指定实例的 SOCKS 端口
+get_instance_socks_port() {
+    local cc="${1^^}"
+    local port_file="$PSI_INSTANCES_DIR/$cc/socks_port.txt"
+    if [[ -f "$port_file" ]]; then
+        cat "$port_file" 2>/dev/null
+    else
+        echo "0"
+    fi
+}
+
+# 写入指定实例的 Psiphon 配置
+write_instance_config() {
+    local cc="${1^^}"
+    local instance_dir="$PSI_INSTANCES_DIR/$cc"
+    local datadir="$instance_dir/psiphon-data"
+    
+    mkdir -p "$datadir" 2>/dev/null
+    
+    # AUTO 时写空字符串
+    local region="$cc"
+    [[ "$region" == "AUTO" ]] && region=""
+    
+    cat > "$instance_dir/psiphon.config" <<EOF
+{
+  "DataRootDirectory": "${datadir}",
+  "EmitDiagnosticNotices": true,
+  "EmitDiagnosticNetworkParameters": true,
+  "EmitServerAlerts": true,
+  
+  "LocalSocksProxyPort": 0,
+  "DisableLocalHTTPProxy": true,
+  "LocalHttpProxyPort": 0,
+  "EgressRegion": "${region}",
+  
+  "PropagationChannelId": "FFFFFFFFFFFFFFFF",
+  "SponsorId": "FFFFFFFFFFFFFFFF",
+  "RemoteServerListDownloadFilename": "${instance_dir}/remote_server_list",
+  "RemoteServerListSignaturePublicKey": "MIICIDANBgkqhkiG9w0BAQEFAAOCAg0AMIICCAKCAgEAt7Ls+/39r+T6zNW7GiVpJfzq/xvL9SBH5rIFnk0RXYEYavax3WS6HOD35eTAqn8AniOwiH+DOkvgSKF2caqk/y1dfq47Pdymtwzp9ikpB1C5OfAysXzBiwVJlCdajBKvBZDerV1cMvRzCKvKwRmvDmHgphQQ7WfXIGbRbmmk6opMBh3roE42KcotLFtqp0RRwLtcBRNtCdsrVsjiI1Lqz/lH+T61sGjSjQ3CHMuZYSQJZo/KrvzgQXpkaCTdbObxHqb6/+i1qaVOfEsvjoiyzTxJADvSytVtcTjijhPEV6XskJVHE1Zgl+7rATr/pDQkw6DPCNBS1+Y6fy7GstZALQXwEDN/qhQI9kWkHijT8ns+i1vGg00Mk/6J75arLhqcodWsdeG/M/moWgqQAnlZAGVtJI1OgeF5fsPpXu4kctOfuZlGjVZXQNW34aOzm8r8S0eVZitPlbhcPiR4gT/aSMz/wd8lZlzZYsje/Jr8u/YtlwjjreZrGRmG8KMOzukV3lLmMppXFMvl4bxv6YFEmIuTsOhbLTwFgh7KYNjodLj/LsqRVfwz31PgWQFTEPICV7GCvgVlPRxnofqKSjgTWI4mxDhBpVcATvaoBl1L/6WLbFvBsoAUBItWwctO2xalKxF5szhGm8lccoc5MZr8kfE0uxMgsxz4er68iCID+rsCAQM=",
+  "RemoteServerListUrl": "https://s3.amazonaws.com//psiphon/web/mjr4-p23r-puwl/server_list_compressed",
+  "UseIndistinguishableTLS": true
+}
+EOF
+}
+
+# 解析实例日志获取实际端口
+parse_instance_port() {
+    local cc="${1^^}"
+    local log="$PSI_INSTANCES_DIR/$cc/psiphon.log"
+    local port_file="$PSI_INSTANCES_DIR/$cc/socks_port.txt"
+    
+    local socks
+    socks="$(grep -a '"noticeType":"ListeningSocksProxyPort"' "$log" 2>/dev/null \
+        | tail -n 1 \
+        | sed -E 's/.*"port":[[:space:]]*([0-9]+).*/\1/' )"
+    
+    if [[ "$socks" =~ ^[0-9]+$ ]] && (( socks > 0 )); then
+        echo "$socks" > "$port_file"
+        echo "$socks"
+    else
+        echo "0"
+    fi
+}
+
+# 等待实例就绪
+wait_instance_ready() {
+    local cc="${1^^}"
+    local log="$PSI_INSTANCES_DIR/$cc/psiphon.log"
+    local timeout=60
+    local elapsed=0
+    
+    while (( elapsed < timeout )); do
+        # 检查端口占用
+        if tail -n 200 "$log" 2>/dev/null | grep -q '"noticeType":"SocksProxyPortInUse"'; then
+            red "[!] Psiphon $cc 端口被占用"
+            return 2
+        fi
+        
+        # 检查已开始监听
+        if tail -n 400 "$log" 2>/dev/null | grep -q '"noticeType":"ListeningSocksProxyPort"'; then
+            parse_instance_port "$cc" > /dev/null
+            return 0
+        fi
+        
+        # 检查隧道建立
+        if tail -n 400 "$log" 2>/dev/null | grep '"noticeType":"Tunnels"' | grep -q '"count":[1-9]'; then
+            parse_instance_port "$cc" > /dev/null
+            return 0
+        fi
+        
+        # 检查进程
+        local pid_file="$PSI_INSTANCES_DIR/$cc/psiphon.pid"
+        if [[ -f "$pid_file" ]]; then
+            local pid=$(cat "$pid_file")
+            if ! kill -0 "$pid" 2>/dev/null; then
+                return 1
+            fi
+        fi
+        
+        sleep 3
+        elapsed=$((elapsed + 3))
+        printf "\r[*] 等待 Psiphon $cc 就绪... %ds/%ds" "$elapsed" "$timeout"
+    done
+    
+    echo
+    return 1
+}
+
+# 启动指定实例
+start_psiphon_instance() {
+    local cc="${1^^}"
+    local instance_dir="$PSI_INSTANCES_DIR/$cc"
+    local bin="$WORKDIR/psiphon-tunnel-core"
+    
+    # 检查二进制
+    if [[ ! -x "$bin" ]]; then
+        yellow "[*] Psiphon 二进制不存在，正在安装..."
+        install_psiphon_userland || return 1
+    fi
+    
+    mkdir -p "$instance_dir" 2>/dev/null
+    
+    # 写配置
+    write_instance_config "$cc"
+    
+    # 停止旧进程
+    stop_psiphon_instance "$cc"
+    
+    # 清空旧日志
+    > "$instance_dir/psiphon.log" 2>/dev/null
+    > "$instance_dir/socks_port.txt" 2>/dev/null
+    
+    yellow "[*] 启动 Psiphon $cc 实例..."
+    
+    cd "$instance_dir"
+    nohup "$bin" -config "$instance_dir/psiphon.config" >> "$instance_dir/psiphon.log" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$instance_dir/psiphon.pid"
+    
+    sleep 2
+    
+    # 检查是否启动
+    if ! kill -0 "$pid" 2>/dev/null; then
+        red "[!] Psiphon $cc 启动失败"
+        tail -20 "$instance_dir/psiphon.log" 2>/dev/null
+        return 1
+    fi
+    
+    # 等待就绪
+    wait_instance_ready "$cc"
+    local status=$?
+    
+    if [[ $status -eq 0 ]]; then
+        local port=$(parse_instance_port "$cc")
+        green "[+] Psiphon $cc 已启动 (SOCKS: 127.0.0.1:$port)"
+        return 0
+    else
+        red "[!] Psiphon $cc 启动超时或失败"
+        return 1
+    fi
+}
+
+# 停止指定实例
+stop_psiphon_instance() {
+    local cc="${1^^}"
+    local pid_file="$PSI_INSTANCES_DIR/$cc/psiphon.pid"
+    
+    if [[ -f "$pid_file" ]]; then
+        local pid=$(cat "$pid_file")
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null
+            sleep 1
+        fi
+    fi
+    
+    # 额外清理
+    pkill -f "psiphon-tunnel-core.*$PSI_INSTANCES_DIR/$cc" 2>/dev/null || true
+}
+
+# 添加 Psiphon 实例
+add_psiphon_instance() {
+    local cc="${1^^}"
+    
+    if [[ -z "$cc" ]]; then
+        red "[!] 请指定国家码"
+        return 1
+    fi
+    
+    init_psiphon_instances_dir
+    
+    local name=$(get_country_name "$cc")
+    yellow "[*] 添加 Psiphon 出口实例: $cc ($name)"
+    
+    # 检查是否已存在
+    if instance_exists "$cc"; then
+        yellow "[*] 实例 $cc 已存在，重新启动..."
+    else
+        # 添加到实例列表
+        local instances=$(get_all_instances | tr '\n' ',' | sed 's/,$//')
+        if [[ -n "$instances" ]]; then
+            echo "$instances,$cc" > "$PSI_INSTANCES_DIR/instances.txt"
+        else
+            echo "$cc" > "$PSI_INSTANCES_DIR/instances.txt"
+        fi
+    fi
+    
+    # 启动实例
+    start_psiphon_instance "$cc"
+}
+
+# 删除 Psiphon 实例
+remove_psiphon_instance() {
+    local cc="${1^^}"
+    
+    if [[ -z "$cc" ]]; then
+        red "[!] 请指定国家码"
+        return 1
+    fi
+    
+    if ! instance_exists "$cc"; then
+        yellow "[*] 实例 $cc 不存在"
+        return 0
+    fi
+    
+    local name=$(get_country_name "$cc")
+    yellow "[*] 删除 Psiphon 出口实例: $cc ($name)"
+    
+    # 停止实例
+    stop_psiphon_instance "$cc"
+    
+    # 删除目录
+    rm -rf "$PSI_INSTANCES_DIR/$cc" 2>/dev/null
+    
+    # 从列表移除
+    local instances=$(get_all_instances | grep -vxF "$cc" | tr '\n' ',' | sed 's/,$//')
+    echo "$instances" > "$PSI_INSTANCES_DIR/instances.txt"
+    
+    green "[+] 已删除实例 $cc"
+}
+
+# 列出所有实例
+list_psiphon_instances() {
+    init_psiphon_instances_dir
+    
+    local instances=($(get_all_instances))
+    
+    if [[ ${#instances[@]} -eq 0 ]]; then
+        yellow "[*] 暂无多出口实例"
+        return 0
+    fi
+    
+    echo
+    green "========== Psiphon 多出口实例 =========="
+    printf "  %-4s %-10s %-8s %-15s\n" "国家" "名称" "状态" "SOCKS端口"
+    echo "  ----------------------------------------"
+    
+    for cc in "${instances[@]}"; do
+        local name=$(get_country_name "$cc")
+        local port=$(get_instance_socks_port "$cc")
+        local pid_file="$PSI_INSTANCES_DIR/$cc/psiphon.pid"
+        local status="✗ 未运行"
+        
+        if [[ -f "$pid_file" ]]; then
+            local pid=$(cat "$pid_file")
+            if kill -0 "$pid" 2>/dev/null; then
+                status="✓ 运行中"
+            fi
+        fi
+        
+        if [[ "$port" == "0" || -z "$port" ]]; then
+            port="未知"
+        else
+            port="127.0.0.1:$port"
+        fi
+        
+        printf "  %-4s %-10s %-8s %-15s\n" "$cc" "$name" "$status" "$port"
+    done
+    echo "========================================="
+}
+
+# 启动所有实例
+start_all_psiphon_instances() {
+    local instances=($(get_all_instances))
+    
+    if [[ ${#instances[@]} -eq 0 ]]; then
+        yellow "[*] 暂无多出口实例"
+        return 0
+    fi
+    
+    for cc in "${instances[@]}"; do
+        start_psiphon_instance "$cc"
+    done
+}
+
+# 停止所有实例
+stop_all_psiphon_instances() {
+    local instances=($(get_all_instances))
+    
+    for cc in "${instances[@]}"; do
+        stop_psiphon_instance "$cc"
+    done
+    
+    green "[+] 已停止所有多出口实例"
+}
+
+# 测试实例出口 IP
+test_instance_egress() {
+    local cc="${1^^}"
+    local port=$(get_instance_socks_port "$cc")
+    
+    if [[ "$port" == "0" || -z "$port" ]]; then
+        red "[!] 无法获取实例 $cc 端口"
+        return 1
+    fi
+    
+    yellow "[*] 测试 $cc 实例出口..."
+    
+    local json
+    json="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${port}" https://ipinfo.io/json 2>/dev/null)" || \
+    json="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${port}" http://ip-api.com/json 2>/dev/null)" || true
+    
+    if [[ -z "$json" ]]; then
+        red "[!] $cc 出口测试失败"
+        return 1
+    fi
+    
+    python3 -c '
+import json, sys
+try:
+    j = json.load(sys.stdin)
+    ip = j.get("ip") or j.get("query") or ""
+    country = j.get("country") or j.get("countryCode") or ""
+    print(f"  $cc 出口: {ip} ({country})")
+except:
+    print("[!] 解析失败")
+' <<<"$json"
+}
+
+# ==================== 多出口节点组管理 ====================
+
+# 获取节点组列表
+get_egress_node_groups() {
+    if [[ -f "$WORKDIR/egress_node_groups.txt" ]]; then
+        cat "$WORKDIR/egress_node_groups.txt" | tr ',' '\n' | grep -v '^$' | sort -u
+    fi
+}
+
+# 检查节点组是否存在
+node_group_exists() {
+    local cc="${1^^}"
+    get_egress_node_groups | grep -qxF "$cc"
+}
+
+# 添加多出口节点组 (核心函数)
+add_egress_node_group() {
+    local cc="${1^^}"
+    local enable_vless="${2:-true}"
+    local enable_hy2="${3:-true}"
+    local enable_tuic="${4:-true}"
+    
+    if [[ -z "$cc" ]]; then
+        red "[!] 请指定出口国家"
+        return 1
+    fi
+    
+    local name=$(get_country_name "$cc")
+    green "==== 添加 $cc ($name) 出口节点组 ===="
+    
+    # 1. 添加并启动 Psiphon 实例
+    yellow "[1/5] 启动 Psiphon $cc 实例..."
+    add_psiphon_instance "$cc" || {
+        red "[!] Psiphon $cc 实例启动失败"
+        return 1
+    }
+    
+    local psi_port=$(get_instance_socks_port "$cc")
+    if [[ "$psi_port" == "0" || -z "$psi_port" ]]; then
+        red "[!] 无法获取 Psiphon $cc 端口"
+        return 1
+    fi
+    green "    Psiphon $cc SOCKS 端口: $psi_port"
+    
+    # 2. 申请新端口
+    yellow "[2/5] 申请新端口..."
+    local tcp_port="" udp_port1="" udp_port2=""
+    local retry=0
+    
+    # TCP 端口 (VLESS)
+    if [[ "$enable_vless" == "true" ]]; then
+        while [[ $retry -lt 20 && -z "$tcp_port" ]]; do
+            local candidate=$(shuf -i 10000-65535 -n 1)
+            if ! check_port_in_use $candidate >/dev/null 2>&1; then
+                result=$(devil port add tcp $candidate 2>&1)
+                if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]]; then
+                    tcp_port=$candidate
+                fi
+            fi
+            ((retry++))
+        done
+        [[ -n "$tcp_port" ]] && green "    VLESS-$cc TCP 端口: $tcp_port"
+    fi
+    
+    # UDP 端口 1 (Hy2)
+    retry=0
+    if [[ "$enable_hy2" == "true" ]]; then
+        while [[ $retry -lt 20 && -z "$udp_port1" ]]; do
+            local candidate=$(shuf -i 10000-65535 -n 1)
+            if ! check_port_in_use $candidate >/dev/null 2>&1; then
+                result=$(devil port add udp $candidate 2>&1)
+                if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]]; then
+                    udp_port1=$candidate
+                fi
+            fi
+            ((retry++))
+        done
+        [[ -n "$udp_port1" ]] && green "    Hysteria2-$cc UDP 端口: $udp_port1"
+    fi
+    
+    # UDP 端口 2 (TUIC)
+    retry=0
+    if [[ "$enable_tuic" == "true" ]]; then
+        while [[ $retry -lt 20 && -z "$udp_port2" ]]; do
+            local candidate=$(shuf -i 10000-65535 -n 1)
+            if ! check_port_in_use $candidate >/dev/null 2>&1; then
+                result=$(devil port add udp $candidate 2>&1)
+                if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]]; then
+                    udp_port2=$candidate
+                fi
+            fi
+            ((retry++))
+        done
+        [[ -n "$udp_port2" ]] && green "    TUIC-$cc UDP 端口: $udp_port2"
+    fi
+    
+    # 保存端口信息
+    mkdir -p "$PSI_INSTANCES_DIR/$cc" 2>/dev/null
+    echo "$tcp_port" > "$PSI_INSTANCES_DIR/$cc/vless_port.txt"
+    echo "$udp_port1" > "$PSI_INSTANCES_DIR/$cc/hy2_port.txt"
+    echo "$udp_port2" > "$PSI_INSTANCES_DIR/$cc/tuic_port.txt"
+    
+    # 3. 更新 sing-box 配置
+    yellow "[3/5] 更新 sing-box 配置..."
+    sync_egress_group_to_singbox "$cc" "$tcp_port" "$udp_port1" "$udp_port2" "$psi_port" || {
+        red "[!] 配置更新失败"
+        return 1
+    }
+    
+    # 4. 添加到节点组列表
+    yellow "[4/5] 保存节点组信息..."
+    local groups=$(get_egress_node_groups | tr '\n' ',' | sed 's/,$//')
+    if [[ -n "$groups" ]]; then
+        echo "$groups,$cc" > "$WORKDIR/egress_node_groups.txt"
+    else
+        echo "$cc" > "$WORKDIR/egress_node_groups.txt"
+    fi
+    
+    # 5. 重启 sing-box
+    yellow "[5/5] 重启 sing-box..."
+    start_singbox_safe || {
+        red "[!] sing-box 重启失败"
+        return 1
+    }
+    
+    green "==== $cc ($name) 节点组添加完成 ===="
+    
+    # 显示新节点链接
+    echo
+    generate_egress_node_links "$cc"
+}
+
+# 同步出口组到 sing-box 配置
+sync_egress_group_to_singbox() {
+    local cc="${1^^}"
+    local vless_port="$2"
+    local hy2_port="$3"
+    local tuic_port="$4"
+    local psi_port="$5"
+    
+    local cfg="$WORKDIR/config.json"
+    local cc_lower=$(echo "$cc" | tr '[:upper:]' '[:lower:]')
+    
+    if [[ ! -f "$cfg" ]]; then
+        red "[!] sing-box 配置不存在"
+        return 1
+    fi
+    
+    # 备份
+    cp "$cfg" "$cfg.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null
+    
+    # 读取现有配置
+    local uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null)
+    local reality_private=$(cat "$WORKDIR/private_key.txt" 2>/dev/null)
+    local reality_domain=$(cat "$WORKDIR/reym.txt" 2>/dev/null)
+    local server_ip="${ALL_IPS[0]:-$HOSTNAME}"
+    
+    python3 - <<PY
+import json
+import sys
+
+cfg_path = r"$cfg"
+cc = r"$cc"
+cc_lower = r"$cc_lower"
+vless_port = int(r"$vless_port") if r"$vless_port" else 0
+hy2_port = int(r"$hy2_port") if r"$hy2_port" else 0
+tuic_port = int(r"$tuic_port") if r"$tuic_port" else 0
+psi_port = int(r"$psi_port")
+uuid = r"$uuid"
+reality_private = r"$reality_private"
+reality_domain = r"$reality_domain"
+server_ip = r"$server_ip"
+
+try:
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception as e:
+    print(f"[!] 读取配置失败: {e}")
+    sys.exit(1)
+
+inbounds = data.setdefault("inbounds", [])
+outbounds = data.setdefault("outbounds", [])
+route = data.setdefault("route", {})
+rules = route.setdefault("rules", [])
+
+# Psiphon 出站 tag
+psi_tag = f"psiphon-{cc_lower}"
+
+# 1. 添加 Psiphon 出站
+psi_out = None
+for o in outbounds:
+    if o.get("tag") == psi_tag:
+        psi_out = o
+        break
+
+if psi_out:
+    psi_out["server_port"] = psi_port
+else:
+    outbounds.append({
+        "type": "socks",
+        "tag": psi_tag,
+        "server": "127.0.0.1",
+        "server_port": psi_port,
+        "version": "5",
+        "network": "tcp"
+    })
+
+inbound_tags = []
+
+# 2. 添加 VLESS inbound
+if vless_port > 0:
+    vless_tag = f"vless-reality-{cc_lower}"
+    inbound_tags.append(vless_tag)
+    
+    # 移除旧的同名 inbound
+    inbounds[:] = [i for i in inbounds if i.get("tag") != vless_tag]
+    
+    inbounds.append({
+        "type": "vless",
+        "tag": vless_tag,
+        "listen": "::",
+        "listen_port": vless_port,
+        "users": [{"uuid": uuid, "flow": "xtls-rprx-vision"}],
+        "tls": {
+            "enabled": True,
+            "server_name": reality_domain,
+            "reality": {
+                "enabled": True,
+                "handshake": {"server": reality_domain, "server_port": 443},
+                "private_key": reality_private,
+                "short_id": [""]
+            }
+        }
+    })
+
+# 3. 添加 Hysteria2 inbound
+if hy2_port > 0:
+    hy2_tag = f"hysteria2-{cc_lower}"
+    inbound_tags.append(hy2_tag)
+    
+    inbounds[:] = [i for i in inbounds if i.get("tag") != hy2_tag]
+    
+    inbounds.append({
+        "type": "hysteria2",
+        "tag": hy2_tag,
+        "listen": "::",
+        "listen_port": hy2_port,
+        "users": [{"password": uuid}],
+        "tls": {
+            "enabled": True,
+            "alpn": ["h3"],
+            "certificate_path": "cert.pem",
+            "key_path": "private.key"
+        }
+    })
+
+# 4. 添加 TUIC inbound
+if tuic_port > 0:
+    tuic_tag = f"tuic-{cc_lower}"
+    inbound_tags.append(tuic_tag)
+    
+    inbounds[:] = [i for i in inbounds if i.get("tag") != tuic_tag]
+    
+    inbounds.append({
+        "type": "tuic",
+        "tag": tuic_tag,
+        "listen": "::",
+        "listen_port": tuic_port,
+        "users": [{"uuid": uuid, "password": uuid}],
+        "congestion_control": "bbr",
+        "tls": {
+            "enabled": True,
+            "alpn": ["h3"],
+            "certificate_path": "cert.pem",
+            "key_path": "private.key"
+        }
+    })
+
+# 5. 添加路由规则
+rule_exists = False
+for r in rules:
+    if r.get("outbound") == psi_tag and "inbound" in r:
+        r["inbound"] = inbound_tags
+        rule_exists = True
+        break
+
+if not rule_exists and inbound_tags:
+    rules.insert(0, {
+        "inbound": inbound_tags,
+        "outbound": psi_tag
+    })
+
+try:
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"[+] sing-box 配置已更新 ({cc} 节点组)")
+except Exception as e:
+    print(f"[!] 写入配置失败: {e}")
+    sys.exit(1)
+PY
+}
+
+# 生成出口节点组链接
+generate_egress_node_links() {
+    local cc="${1^^}"
+    local cc_lower=$(echo "$cc" | tr '[:upper:]' '[:lower:]')
+    local name=$(get_country_name "$cc")
+    
+    local vless_port=$(cat "$PSI_INSTANCES_DIR/$cc/vless_port.txt" 2>/dev/null)
+    local hy2_port=$(cat "$PSI_INSTANCES_DIR/$cc/hy2_port.txt" 2>/dev/null)
+    local tuic_port=$(cat "$PSI_INSTANCES_DIR/$cc/tuic_port.txt" 2>/dev/null)
+    
+    local uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null)
+    local reality_public=$(cat "$WORKDIR/public_key.txt" 2>/dev/null)
+    local reality_domain=$(cat "$WORKDIR/reym.txt" 2>/dev/null)
+    local server_ip="${ALL_IPS[0]:-$HOSTNAME}"
+    
+    echo
+    green "========== $cc ($name) 出口节点链接 =========="
+    
+    # VLESS-Reality
+    if [[ -n "$vless_port" && "$vless_port" != "0" ]]; then
+        local vless_link="vless://${uuid}@${server_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reality_domain}&fp=chrome&pbk=${reality_public}&type=tcp#VLESS-Reality-${cc}"
+        echo
+        purple "VLESS-Reality-$cc:"
+        echo "$vless_link"
+    fi
+    
+    # Hysteria2
+    if [[ -n "$hy2_port" && "$hy2_port" != "0" ]]; then
+        local hy2_link="hysteria2://${uuid}@${server_ip}:${hy2_port}?insecure=1&sni=${server_ip}#Hysteria2-${cc}"
+        echo
+        purple "Hysteria2-$cc:"
+        echo "$hy2_link"
+    fi
+    
+    # TUIC
+    if [[ -n "$tuic_port" && "$tuic_port" != "0" ]]; then
+        local tuic_link="tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?congestion_control=bbr&alpn=h3&allow_insecure=1#TUIC-${cc}"
+        echo
+        purple "TUIC-$cc:"
+        echo "$tuic_link"
+    fi
+    
+    echo "============================================="
+}
+
+# 删除出口节点组
+remove_egress_node_group() {
+    local cc="${1^^}"
+    
+    if [[ -z "$cc" ]]; then
+        red "[!] 请指定国家码"
+        return 1
+    fi
+    
+    local name=$(get_country_name "$cc")
+    yellow "[*] 删除 $cc ($name) 出口节点组..."
+    
+    # 读取端口信息
+    local vless_port=$(cat "$PSI_INSTANCES_DIR/$cc/vless_port.txt" 2>/dev/null)
+    local hy2_port=$(cat "$PSI_INSTANCES_DIR/$cc/hy2_port.txt" 2>/dev/null)
+    local tuic_port=$(cat "$PSI_INSTANCES_DIR/$cc/tuic_port.txt" 2>/dev/null)
+    
+    # 删除端口
+    [[ -n "$vless_port" ]] && devil port del tcp "$vless_port" >/dev/null 2>&1
+    [[ -n "$hy2_port" ]] && devil port del udp "$hy2_port" >/dev/null 2>&1
+    [[ -n "$tuic_port" ]] && devil port del udp "$tuic_port" >/dev/null 2>&1
+    
+    # 删除 Psiphon 实例
+    remove_psiphon_instance "$cc"
+    
+    # 从节点组列表移除
+    local groups=$(get_egress_node_groups | grep -vxF "$cc" | tr '\n' ',' | sed 's/,$//')
+    echo "$groups" > "$WORKDIR/egress_node_groups.txt"
+    
+    # 更新 sing-box 配置 (移除相关 inbound 和 outbound)
+    remove_egress_from_singbox "$cc"
+    
+    # 重启 sing-box
+    start_singbox_safe
+    
+    green "[+] 已删除 $cc 出口节点组"
+}
+
+# 从 sing-box 配置移除出口组
+remove_egress_from_singbox() {
+    local cc="${1^^}"
+    local cc_lower=$(echo "$cc" | tr '[:upper:]' '[:lower:]')
+    local cfg="$WORKDIR/config.json"
+    
+    [[ -f "$cfg" ]] || return 0
+    
+    python3 - <<PY
+import json
+
+cfg_path = r"$cfg"
+cc_lower = r"$cc_lower"
+
+try:
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except:
+    exit(0)
+
+inbounds = data.get("inbounds", [])
+outbounds = data.get("outbounds", [])
+route = data.get("route", {})
+rules = route.get("rules", [])
+
+# 移除相关 inbound
+inbounds[:] = [i for i in inbounds if not i.get("tag", "").endswith(f"-{cc_lower}")]
+
+# 移除相关 outbound
+psi_tag = f"psiphon-{cc_lower}"
+outbounds[:] = [o for o in outbounds if o.get("tag") != psi_tag]
+
+# 移除相关路由规则
+rules[:] = [r for r in rules if r.get("outbound") != psi_tag]
+
+try:
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+except:
+    pass
+PY
+}
+
+# 多出口节点管理菜单
+multi_egress_menu() {
+    while true; do
+        clear
+        echo
+        green "============================================================"
+        green "  多出口节点组管理"
+        green "============================================================"
+        echo
+        
+        # 显示现有节点组
+        local groups=($(get_egress_node_groups))
+        if [[ ${#groups[@]} -gt 0 ]]; then
+            green "现有出口节点组:"
+            for cc in "${groups[@]}"; do
+                local name=$(get_country_name "$cc")
+                local port=$(get_instance_socks_port "$cc")
+                local pid_file="$PSI_INSTANCES_DIR/$cc/psiphon.pid"
+                local status="✗"
+                if [[ -f "$pid_file" ]] && kill -0 $(cat "$pid_file") 2>/dev/null; then
+                    status="✓"
+                fi
+                printf "  %s %-4s %-10s (Psiphon: %s)\n" "$status" "$cc" "$name" "$port"
+            done
+        else
+            yellow "  暂无多出口节点组"
+        fi
+        
+        echo
+        echo "------------------------------------------------------------"
+        green "  1. ➕ 添加新出口节点组"
+        green "  2. ➖ 删除出口节点组"
+        green "  3. 📋 查看所有节点链接"
+        echo "  ------------"
+        yellow "  4. 🔄 重启所有 Psiphon 实例"
+        yellow "  5. ⏹️  停止所有 Psiphon 实例"
+        yellow "  6. 🔍 测试所有出口 IP"
+        echo "  ------------"
+        red "  0. 返回上级菜单"
+        echo "============================================================"
+        reading "请选择 [0-6]: " choice
+        echo
+        
+        case "$choice" in
+            1)
+                echo
+                green "常用国家码:"
+                yellow "  US=美国 JP=日本 SG=新加坡 HK=香港 TW=台湾"
+                yellow "  KR=韩国 GB=英国 DE=德国 FR=法国 NL=荷兰"
+                echo
+                reading "请输入要添加的国家码 (如 JP): " new_cc
+                
+                if [[ -n "$new_cc" ]]; then
+                    echo
+                    yellow "选择要启用的协议:"
+                    yellow "  1. 全部 (VLESS + Hy2 + TUIC) - 需要 3 端口"
+                    yellow "  2. 仅 VLESS-Reality - 需要 1 TCP 端口"
+                    yellow "  3. 仅 UDP (Hy2 + TUIC) - 需要 2 UDP 端口"
+                    yellow "  4. 仅 Hysteria2 - 需要 1 UDP 端口"
+                    reading "请选择 [1-4]: " proto_choice
+                    
+                    case "$proto_choice" in
+                        1) add_egress_node_group "$new_cc" true true true ;;
+                        2) add_egress_node_group "$new_cc" true false false ;;
+                        3) add_egress_node_group "$new_cc" false true true ;;
+                        4) add_egress_node_group "$new_cc" false true false ;;
+                        *) add_egress_node_group "$new_cc" true true true ;;
+                    esac
+                fi
+                ;;
+            2)
+                if [[ ${#groups[@]} -eq 0 ]]; then
+                    yellow "暂无节点组可删除"
+                else
+                    echo
+                    reading "请输入要删除的国家码: " del_cc
+                    [[ -n "$del_cc" ]] && remove_egress_node_group "$del_cc"
+                fi
+                ;;
+            3)
+                echo
+                for cc in "${groups[@]}"; do
+                    generate_egress_node_links "$cc"
+                done
+                ;;
+            4)
+                start_all_psiphon_instances
+                ;;
+            5)
+                stop_all_psiphon_instances
+                ;;
+            6)
+                echo
+                for cc in "${groups[@]}"; do
+                    test_instance_egress "$cc"
+                done
                 ;;
             0)
                 return 0
