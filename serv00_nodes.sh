@@ -1550,6 +1550,93 @@ PY
     return 0
 }
 
+# 同步所有 Psiphon 端口到 sing-box 配置 (全局 + 各出口实例)
+sync_all_psiphon_ports() {
+    local cfg="$WORKDIR/config.json"
+    [[ -f "$cfg" ]] || return 0
+
+    # 收集所有 Psiphon outbound tag → 实际端口 的映射
+    local tag_port_pairs=""
+
+    # 1. 全局 psiphon-out
+    local global_port
+    global_port="$(get_psiphon_socks_port)"
+    if [[ "$global_port" =~ ^[0-9]+$ ]] && (( global_port > 0 )); then
+        tag_port_pairs="psiphon-out:$global_port"
+    fi
+
+    # 2. 各出口实例 psiphon-<cc>
+    if [[ -f "$WORKDIR/egress_node_groups.txt" ]]; then
+        local groups
+        groups="$(cat "$WORKDIR/egress_node_groups.txt" 2>/dev/null)"
+        IFS=',' read -ra cc_arr <<< "$groups"
+        for cc in "${cc_arr[@]}"; do
+            cc="$(echo "$cc" | tr '[:upper:]' '[:lower:]' | xargs)"
+            [[ -z "$cc" ]] && continue
+            local inst_port
+            inst_port="$(get_instance_socks_port "${cc^^}")"
+            if [[ "$inst_port" =~ ^[0-9]+$ ]] && (( inst_port > 0 )); then
+                local tag="psiphon-${cc}"
+                if [[ -n "$tag_port_pairs" ]]; then
+                    tag_port_pairs="$tag_port_pairs,$tag:$inst_port"
+                else
+                    tag_port_pairs="$tag:$inst_port"
+                fi
+            fi
+        done
+    fi
+
+    [[ -z "$tag_port_pairs" ]] && return 0
+
+    yellow "[*] 同步 Psiphon 端口到 sing-box 配置..."
+
+    python3 - <<PY
+import json, sys
+
+cfg_path = r"$cfg"
+pairs_str = r"$tag_port_pairs"  # tag1:port1,tag2:port2
+
+try:
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception as e:
+    print(f"[!] 读取配置失败: {e}")
+    sys.exit(1)
+
+pairs = {}
+for p in pairs_str.split(","):
+    if ":" in p:
+        tag, port = p.rsplit(":", 1)
+        pairs[tag.strip()] = int(port.strip())
+
+outbounds = data.get("outbounds", [])
+updated = 0
+for o in outbounds:
+    tag = o.get("tag", "")
+    if tag in pairs:
+        old_port = o.get("server_port", 0)
+        new_port = pairs[tag]
+        if old_port != new_port:
+            o["server"] = "127.0.0.1"
+            o["server_port"] = new_port
+            print(f"  {tag}: {old_port} -> {new_port}")
+            updated += 1
+        else:
+            print(f"  {tag}: {old_port} (未变化)")
+
+if updated > 0:
+    try:
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"[+] 已更新 {updated} 个 Psiphon 出站端口")
+    except Exception as e:
+        print(f"[!] 写入配置失败: {e}")
+        sys.exit(1)
+else:
+    print("[*] 所有端口无变化")
+PY
+}
+
 # 停止 Psiphon
 stop_psiphon_userland() {
     # 只杀自己目录的二进制 (避免误杀系统进程)
@@ -5031,6 +5118,29 @@ restart_processes() {
     sleep 2
     
     cd "$WORKDIR"
+    
+    # 重启 Psiphon 实例 (如果启用)
+    local psi_enabled
+    psi_enabled="$(cat "$WORKDIR/psiphon_enabled.txt" 2>/dev/null || echo "false")"
+    if [[ "$psi_enabled" == "true" ]]; then
+        yellow "重启 Psiphon 实例..."
+        start_psiphon_userland 2>/dev/null || true
+        # 重启各出口实例
+        if [[ -f "$WORKDIR/egress_node_groups.txt" ]]; then
+            local groups
+            groups="$(cat "$WORKDIR/egress_node_groups.txt" 2>/dev/null)"
+            IFS=',' read -ra cc_arr <<< "$groups"
+            for cc in "${cc_arr[@]}"; do
+                cc="$(echo "$cc" | xargs)"
+                [[ -z "$cc" ]] && continue
+                start_psiphon_instance "$cc" 2>/dev/null || true
+            done
+        fi
+        sleep 3
+        # 同步 Psiphon 端口到 sing-box 配置
+        sync_all_psiphon_ports
+    fi
+    
     start_singbox
     
     ARGO_AUTH=$(cat ARGO_AUTH.log 2>/dev/null)
