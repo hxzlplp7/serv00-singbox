@@ -3619,7 +3619,7 @@ generate_singbox_config() {
     cat > config.json <<EOF
 {
   "log": {
-    "disabled": true,
+    "disabled": false,
     "level": "info",
     "timestamp": true
   },
@@ -3968,20 +3968,22 @@ start_singbox() {
     cd "$WORKDIR"
     SB_BINARY=$(cat sb.txt 2>/dev/null)
     
-    if [ -z "$SB_BINARY" ] || [ ! -f "$SB_BINARY" ]; then
+    if [ -z "$SB_BINARY" ] || [ ! -f "$WORKDIR/$SB_BINARY" ]; then
         red "sing-box二进制文件未找到"
         return 1
     fi
     
     # 杀掉现有进程
-    pkill -f "run -c config.json" >/dev/null 2>&1
+    pkill -f "$WORKDIR/$SB_BINARY" >/dev/null 2>&1 || true
+    pkill -x "$SB_BINARY" >/dev/null 2>&1 || true
+    sleep 1
     
     # 清空旧日志
     > "$WORKDIR/singbox.log"
     
     # 先验证配置
     yellow "验证配置文件..."
-    config_check=$(./"$SB_BINARY" check -c config.json 2>&1)
+    config_check=$(cd "$WORKDIR" && ./"$SB_BINARY" check -c "$WORKDIR/config.json" 2>&1)
     if [ $? -ne 0 ]; then
         red "配置文件验证失败:"
         echo "$config_check" | head -20
@@ -3989,16 +3991,19 @@ start_singbox() {
     fi
     green "配置文件验证通过"
     
-    # 启动sing-box，保存日志
-    nohup ./"$SB_BINARY" run -c config.json >> "$WORKDIR/singbox.log" 2>&1 &
+    # 使用 run_detached 启动 (FreeBSD 使用 daemon 命令可靠脱离终端)
+    run_detached "$WORKDIR/singbox.pid" "$WORKDIR/singbox.log" \
+        "$WORKDIR/$SB_BINARY" run -c "$WORKDIR/config.json"
     sleep 3
     
-    if pgrep -x "$SB_BINARY" > /dev/null; then
+    if pgrep -f "$WORKDIR/$SB_BINARY" > /dev/null 2>&1 || pgrep -x "$SB_BINARY" > /dev/null 2>&1; then
         green "sing-box 主进程已启动"
         return 0
     else
         red "sing-box 主进程启动失败"
-        show_singbox_log
+        yellow "========== sing-box 错误日志 =========="
+        tail -30 "$WORKDIR/singbox.log" 2>/dev/null
+        yellow "======================================"
         return 1
     fi
 }
