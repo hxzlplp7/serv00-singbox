@@ -4174,6 +4174,44 @@ stop_all() {
 
 # ==================== 节点链接生成 ====================
 
+# 加载已保存的配置 (端口/UUID/协议/密钥等)
+load_saved_config() {
+    cd "$WORKDIR" 2>/dev/null || return 1
+
+    # 加载端口
+    if [ -f "$WORKDIR/ports.txt" ]; then
+        source "$WORKDIR/ports.txt"
+    fi
+
+    # 加载UUID
+    if [ -f "$WORKDIR/UUID.txt" ]; then
+        UUID=$(cat "$WORKDIR/UUID.txt" 2>/dev/null)
+    fi
+
+    # 加载协议开关
+    [ -f "$WORKDIR/enable_argo.txt" ]   && ENABLE_ARGO=$(cat "$WORKDIR/enable_argo.txt" 2>/dev/null)
+    [ -f "$WORKDIR/enable_vless.txt" ]   && ENABLE_VLESS_REALITY=$(cat "$WORKDIR/enable_vless.txt" 2>/dev/null)
+    [ -f "$WORKDIR/enable_vmess.txt" ]   && ENABLE_VMESS_WS=$(cat "$WORKDIR/enable_vmess.txt" 2>/dev/null)
+    [ -f "$WORKDIR/enable_trojan.txt" ]  && ENABLE_TROJAN_WS=$(cat "$WORKDIR/enable_trojan.txt" 2>/dev/null)
+    [ -f "$WORKDIR/enable_hy2.txt" ]     && ENABLE_HYSTERIA2=$(cat "$WORKDIR/enable_hy2.txt" 2>/dev/null)
+    [ -f "$WORKDIR/enable_tuic.txt" ]    && ENABLE_TUIC=$(cat "$WORKDIR/enable_tuic.txt" 2>/dev/null)
+    [ -f "$WORKDIR/enable_ss.txt" ]      && ENABLE_SHADOWSOCKS=$(cat "$WORKDIR/enable_ss.txt" 2>/dev/null)
+
+    # 加载Reality密钥
+    [ -f "$WORKDIR/public_key.txt" ]  && REALITY_PUBLIC_KEY=$(cat "$WORKDIR/public_key.txt" 2>/dev/null)
+    [ -f "$WORKDIR/private_key.txt" ] && REALITY_PRIVATE_KEY=$(cat "$WORKDIR/private_key.txt" 2>/dev/null)
+
+    # 加载Reality域名
+    [ -f "$WORKDIR/reym.txt" ] && REALITY_DOMAIN=$(cat "$WORKDIR/reym.txt" 2>/dev/null)
+
+    # 加载SUB_TOKEN
+    export SUB_TOKEN=${SUB_TOKEN:-${UUID:0:8}}
+
+    # 加载Argo信息
+    [ -f "$WORKDIR/ARGO_AUTH.log" ]   && ARGO_AUTH=$(cat "$WORKDIR/ARGO_AUTH.log" 2>/dev/null)
+    [ -f "$WORKDIR/ARGO_DOMAIN.log" ] && ARGO_DOMAIN=$(cat "$WORKDIR/ARGO_DOMAIN.log" 2>/dev/null)
+}
+
 # 获取Argo域名
 get_argo_domain() {
     if [[ -n $ARGO_AUTH ]] && [[ -n $ARGO_DOMAIN ]]; then
@@ -4201,6 +4239,8 @@ get_argo_domain() {
 
 # 生成节点链接
 generate_links() {
+    # 加载已保存的配置 (确保端口/UUID等变量可用)
+    load_saved_config
     cd "$WORKDIR"
     
     # 读取IP列表
@@ -4437,6 +4477,8 @@ custom_push_nodes() {
         return 1
     fi
     
+    # 加载已保存的配置 (确保端口/UUID/协议等变量可用)
+    load_saved_config
     cd "$WORKDIR"
     
     # 读取当前启用的协议
@@ -4976,6 +5018,8 @@ uninstall_nodes() {
 
 # 重启进程
 restart_processes() {
+    # 加载已保存的配置 (确保端口/UUID/协议等变量可用)
+    load_saved_config
     yellow "正在重启所有进程..."
     
     stop_all
