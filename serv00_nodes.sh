@@ -1635,6 +1635,9 @@ if updated > 0:
 else:
     print("[*] 所有端口无变化")
 PY
+
+    # 重启 sing-box 使最新端口生效
+    start_singbox_safe || yellow "[!] sing-box 重启失败，请手动重启"
 }
 
 # 停止 Psiphon
