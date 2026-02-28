@@ -1651,7 +1651,7 @@ stop_psiphon_userland() {
     
     # 兜底清理：使用 ps 配合 grep 精确匹配主配置的启动命令 (适配 FreeBSD 等对 pkill 参数长度有限制的系统)
     local ps_output
-    ps_output=$(ps xww | grep -v grep | grep "psiphon-tunnel-core" | grep "\-config $WORKDIR/psiphon.config")
+    ps_output=$(ps xww | grep "[p]siphon-tunnel-core" | grep "/psiphon.config")
     if [[ -n "$ps_output" ]]; then
         echo "$ps_output" | awk '{print $1}' | while read -r pid; do
             kill -9 "$pid" 2>/dev/null || true
@@ -2497,7 +2497,7 @@ stop_psiphon_instance() {
     
     # 额外清理适配 FreeBSD：使用 ps 配合 grep
     local ps_output
-    ps_output=$(ps xww | grep -v grep | grep "psiphon-tunnel-core" | grep "$PSI_INSTANCES_DIR/$cc")
+    ps_output=$(ps xww | grep "[p]siphon-tunnel-core" | grep "$PSI_INSTANCES_DIR/$cc")
     if [[ -n "$ps_output" ]]; then
         echo "$ps_output" | awk '{print $1}' | while read -r pid; do
             kill -9 "$pid" 2>/dev/null || true
