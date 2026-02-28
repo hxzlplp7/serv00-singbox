@@ -2638,6 +2638,10 @@ start_all_psiphon_instances() {
     for cc in "${instances[@]}"; do
         start_psiphon_instance "$cc"
     done
+    
+    # 同步最新动态端口到 sing-box 配置 (重启后端口可能变化)
+    yellow "[*] 同步最新端口到 sing-box..."
+    sync_all_psiphon_ports || yellow "[!] 端口同步失败，请手动重启 sing-box"
 }
 
 # 停止所有实例
@@ -2655,6 +2659,7 @@ stop_all_psiphon_instances() {
 test_instance_egress() {
     local cc="${1^^}"
     local port=$(get_instance_socks_port "$cc")
+
     
     if [[ "$port" == "0" || -z "$port" ]]; then
         red "[!] 无法获取实例 $cc 端口"
@@ -2672,16 +2677,10 @@ test_instance_egress() {
         return 1
     fi
     
-    python3 -c '
-import json, sys
-try:
-    j = json.load(sys.stdin)
-    ip = j.get("ip") or j.get("query") or ""
-    country = j.get("country") or j.get("countryCode") or ""
-    print(f"  $cc 出口: {ip} ({country})")
-except:
-    print("[!] 解析失败")
-' <<<"$json"
+    local ip country
+    ip=$(echo "$json" | python3 -c "import json,sys; j=json.load(sys.stdin); print(j.get('ip') or j.get('query',''))" 2>/dev/null)
+    country=$(echo "$json" | python3 -c "import json,sys; j=json.load(sys.stdin); print(j.get('country') or j.get('countryCode',''))" 2>/dev/null)
+    green "  $cc 出口: $ip ($country)"
 }
 
 # ==================== 多出口节点组管理 ====================
