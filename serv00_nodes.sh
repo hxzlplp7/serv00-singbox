@@ -1637,7 +1637,28 @@ else:
 PY
 
     # 重启 sing-box 使最新端口生效
-    start_singbox_safe || yellow "[!] sing-box 重启失败，请手动重启"
+    yellow "[*] 正在重启 sing-box..."
+    if start_singbox_safe; then
+        green "[+] sing-box 已重启，新端口已生效"
+    else
+        # start_singbox_safe 可能因为配置校验失败而退出，直接强制重启
+        local sb_binary
+        sb_binary="$(cat "$WORKDIR/sb.txt" 2>/dev/null)"
+        if [[ -n "$sb_binary" && -f "$WORKDIR/$sb_binary" ]]; then
+            pkill -f "$WORKDIR/$sb_binary" >/dev/null 2>&1 || true
+            pkill -x "$sb_binary" >/dev/null 2>&1 || true
+            sleep 1
+            cd "$WORKDIR"
+            run_detached "$WORKDIR/singbox.pid" "$WORKDIR/singbox.log" \
+                "$WORKDIR/$sb_binary" run -c "$WORKDIR/config.json"
+            sleep 2
+            if pgrep -x "$sb_binary" >/dev/null 2>&1; then
+                green "[+] sing-box 重启成功"
+            else
+                red "[!] sing-box 重启失败，请检查日志: $WORKDIR/singbox.log"
+            fi
+        fi
+    fi
 }
 
 # 停止 Psiphon
