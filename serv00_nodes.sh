@@ -1910,11 +1910,11 @@ psiphon_egress_test() {
 
     yellow "[*] 正在检测 Psiphon 出口 IP..."
     
-    # 检查 Psiphon 是否在运行 (使用 kill -0 代替 pgrep 减少 fork)
+    # 检查 Psiphon 是否在运行
     local psi_pid
-    psi_pid="$(cat "$WORKDIR/psiphon.pid" 2>/dev/null || pgrep -f "psiphon-tunnel-core" | head -n1)"
+    psi_pid="$(cat "$WORKDIR/psiphon.pid" 2>/dev/null)"
     if [[ -z "$psi_pid" ]] || ! kill -0 "$psi_pid" 2>/dev/null; then
-        red "[!] Psiphon 未运行"
+        red "[!] 全局 Psiphon 进程未运行"
         return 1
     fi
 
@@ -2194,23 +2194,37 @@ psiphon_management_menu() {
         green "============================================================"
         echo
         
+        # 检查运行状态
+        local psi_pid_file="$WORKDIR/psiphon.pid"
+        local is_running=false
+        if [[ -f "$psi_pid_file" ]]; then
+            local pid=$(cat "$psi_pid_file" 2>/dev/null)
+            if kill -0 "$pid" 2>/dev/null; then
+                is_running=true
+            fi
+        fi
+        
         # 显示当前状态
         local psi_enabled=$(cat "$WORKDIR/psiphon_enabled.txt" 2>/dev/null)
         local psi_region=$(cat "$WORKDIR/psiphon_region.txt" 2>/dev/null)
         local psi_socks=$(get_psiphon_socks_port)
         psi_region="${psi_region:-AUTO}"
+        local region_name=$(get_country_name "$psi_region")
         
-        if [[ "$psi_enabled" == "true" ]]; then
-            local region_name=$(get_country_name "$psi_region")
-            if pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1; then
-                green "状态:     ✓ 已启用并运行中"
+        if [[ "$is_running" == "true" ]]; then
+            if [[ "$psi_enabled" == "true" ]]; then
+                green "状态:     ✓ 运行中 (作为全局出站使用)"
             else
-                yellow "状态:     ⚠ 已启用但未运行"
+                yellow "状态:     ⚠ 运行中 (仅后台运行，未作为全局出站)"
             fi
             blue "出口国家: $psi_region ($region_name)"
             blue "SOCKS端口: 127.0.0.1:$psi_socks"
         else
-            yellow "状态:     ✗ 未启用"
+            if [[ "$psi_enabled" == "true" ]]; then
+                red "状态:     ⚠ 异常 (已配置出站，但后台进程未运行)"
+            else
+                yellow "状态:     ✗ 未启用"
+            fi
         fi
         
         echo
