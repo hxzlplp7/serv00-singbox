@@ -1649,12 +1649,16 @@ stop_psiphon_userland() {
         fi
     fi
     
-    # 兜底清理：使用 ps 配合 grep 精确匹配主配置的启动命令 (适配 FreeBSD 等对 pkill 参数长度有限制的系统)
-    local ps_output
-    ps_output=$(ps xww | grep "[p]siphon-tunnel-core" | grep "/psiphon.config")
-    if [[ -n "$ps_output" ]]; then
-        echo "$ps_output" | awk '{print $1}' | while read -r pid; do
-            kill -9 "$pid" 2>/dev/null || true
+    # 兜底清理：使用 pgrep 查找所有名为 psiphon-tunnel-core 的进程，并通过 ps 精确检定其参数
+    # 适配 FreeBSD 等对 pkill/pgrep 参数长度有 15 字符截断限制的系统
+    if command -v pgrep >/dev/null 2>&1; then
+        for pid in $(pgrep -x "psiphon-tunnel-core" 2>/dev/null || pgrep "psiphon-tunnel"); do
+            # 获取该 PID 的完整启动命令
+            local cmd
+            cmd=$(ps -o args= -p "$pid" 2>/dev/null)
+            if echo "$cmd" | grep -q "/psiphon.config"; then
+                kill -9 "$pid" 2>/dev/null || true
+            fi
         done
     fi
     sleep 1
@@ -2488,19 +2492,21 @@ stop_psiphon_instance() {
     local pid_file="$PSI_INSTANCES_DIR/$cc/psiphon.pid"
     
     if [[ -f "$pid_file" ]]; then
-        local pid=$(cat "$pid_file")
+        local pid=$(cat "$pid_file" 2>/dev/null)
         if kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null
             sleep 1
         fi
     fi
     
-    # 额外清理适配 FreeBSD：使用 ps 配合 grep
-    local ps_output
-    ps_output=$(ps xww | grep "[p]siphon-tunnel-core" | grep "$PSI_INSTANCES_DIR/$cc")
-    if [[ -n "$ps_output" ]]; then
-        echo "$ps_output" | awk '{print $1}' | while read -r pid; do
-            kill -9 "$pid" 2>/dev/null || true
+    # 额外清理适配 FreeBSD：使用 pgrep 结合 ps 强校验
+    if command -v pgrep >/dev/null 2>&1; then
+        for pid in $(pgrep -x "psiphon-tunnel-core" 2>/dev/null || pgrep "psiphon-tunnel"); do
+            local cmd
+            cmd=$(ps -o args= -p "$pid" 2>/dev/null)
+            if echo "$cmd" | grep -q "$PSI_INSTANCES_DIR/$cc"; then
+                kill -9 "$pid" 2>/dev/null || true
+            fi
         done
     fi
 }
