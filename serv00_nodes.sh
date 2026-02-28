@@ -1639,9 +1639,18 @@ PY
 
 # 停止 Psiphon
 stop_psiphon_userland() {
-    # 只杀自己目录的二进制 (避免误杀系统进程)
-    pkill -f "$WORKDIR/psiphon-tunnel-core" >/dev/null 2>&1 || true
-    pkill -f "psiphon-tunnel-core.*psiphon.config" >/dev/null 2>&1 || true
+    # 优先使用 PID 安全停止 (避免误杀自己目录或多出口实例里的其他进程)
+    local pid_file="$WORKDIR/psiphon.pid"
+    if [[ -f "$pid_file" ]]; then
+        local pid=$(cat "$pid_file" 2>/dev/null)
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null
+            sleep 1
+        fi
+    fi
+    
+    # 兜底清理：只杀带有主配置路径参数的二进制 (避免误杀多节点组的实例)
+    pkill -f "psiphon-tunnel-core.*-config.*$WORKDIR/psiphon\.config" >/dev/null 2>&1 || true
     sleep 1
 }
 
