@@ -1879,47 +1879,92 @@ PY
 
 # ==================== Psiphon 国家管理 (psictl 等价功能) ====================
 
-# 常用国家码列表
-PSI_ALL_CC=(US JP SG HK TW KR GB DE FR NL CA AU AT BE CH CZ DK EE ES FI HU IE IN IT LV NO PL RO RS SE SK)
+# Psiphon 支持的出口国家码列表
+PSI_ALL_CC=(
+    AE HK IN ID JP KR MY SG TW
+    AT BE BG CH CZ DE DK EE ES FI FR GB GR HR HU IE IS IT LT LV NL NO PL PT RO RS SE SK UA
+    AR BR CA CL CO MX US
+    AU NZ
+    KE ZA
+)
 
 # 国家码到中文名映射
 get_country_name() {
     local cc="${1^^}"
     case "$cc" in
-        US) echo "美国" ;;
-        JP) echo "日本" ;;
-        SG) echo "新加坡" ;;
+        AE) echo "阿联酋" ;;
         HK) echo "香港" ;;
-        TW) echo "台湾" ;;
+        IN) echo "印度" ;;
+        ID) echo "印度尼西亚" ;;
+        JP) echo "日本" ;;
         KR) echo "韩国" ;;
-        GB) echo "英国" ;;
-        DE) echo "德国" ;;
-        FR) echo "法国" ;;
-        NL) echo "荷兰" ;;
-        CA) echo "加拿大" ;;
-        AU) echo "澳大利亚" ;;
+        MY) echo "马来西亚" ;;
+        SG) echo "新加坡" ;;
+        TW) echo "台湾地区" ;;
         AT) echo "奥地利" ;;
         BE) echo "比利时" ;;
+        BG) echo "保加利亚" ;;
         CH) echo "瑞士" ;;
         CZ) echo "捷克" ;;
+        DE) echo "德国" ;;
         DK) echo "丹麦" ;;
         EE) echo "爱沙尼亚" ;;
         ES) echo "西班牙" ;;
         FI) echo "芬兰" ;;
+        FR) echo "法国" ;;
+        GB) echo "英国" ;;
+        GR) echo "希腊" ;;
+        HR) echo "克罗地亚" ;;
         HU) echo "匈牙利" ;;
         IE) echo "爱尔兰" ;;
-        IN) echo "印度" ;;
+        IS) echo "冰岛" ;;
         IT) echo "意大利" ;;
+        LT) echo "立陶宛" ;;
         LV) echo "拉脱维亚" ;;
+        NL) echo "荷兰" ;;
         NO) echo "挪威" ;;
         PL) echo "波兰" ;;
+        PT) echo "葡萄牙" ;;
         RO) echo "罗马尼亚" ;;
         RS) echo "塞尔维亚" ;;
         SE) echo "瑞典" ;;
         SK) echo "斯洛伐克" ;;
+        UA) echo "乌克兰" ;;
+        AR) echo "阿根廷" ;;
+        BR) echo "巴西" ;;
+        CA) echo "加拿大" ;;
+        CL) echo "智利" ;;
+        CO) echo "哥伦比亚" ;;
+        MX) echo "墨西哥" ;;
+        US) echo "美国" ;;
+        AU) echo "澳大利亚" ;;
+        NZ) echo "新西兰" ;;
+        KE) echo "肯尼亚" ;;
+        ZA) echo "南非" ;;
         AUTO) echo "自动" ;;
         *) echo "$cc" ;;
     esac
+}
+
+is_supported_psiphon_cc() {
+    local cc="${1^^}"
+    [[ "$cc" == "AUTO" ]] && return 0
+    local item
+    for item in "${PSI_ALL_CC[@]}"; do
+        [[ "$item" == "$cc" ]] && return 0
+    done
+    return 1
+}
+
+show_supported_psiphon_codes() {
+    yellow "支持国家码:"
+    yellow "  亚洲/中东: AE=阿联酋 HK=香港 IN=印度 ID=印度尼西亚 JP=日本 KR=韩国 MY=马来西亚 SG=新加坡 TW=台湾地区"
+    yellow "  欧洲: AT=奥地利 BE=比利时 BG=保加利亚 CH=瑞士 CZ=捷克 DE=德国 DK=丹麦 EE=爱沙尼亚 ES=西班牙 FI=芬兰 FR=法国"
+    yellow "        GB=英国 GR=希腊 HR=克罗地亚 HU=匈牙利 IE=爱尔兰 IS=冰岛 IT=意大利 LT=立陶宛 LV=拉脱维亚 NL=荷兰"
+    yellow "        NO=挪威 PL=波兰 PT=葡萄牙 RO=罗马尼亚 RS=塞尔维亚 SE=瑞典 SK=斯洛伐克 UA=乌克兰"
+    yellow "  美洲: AR=阿根廷 BR=巴西 CA=加拿大 CL=智利 CO=哥伦比亚 MX=墨西哥 US=美国"
+    yellow "  大洋洲: AU=澳大利亚 NZ=新西兰"
+    yellow "  非洲: KE=肯尼亚 ZA=南非 AUTO=自动"
 }
 
 # 出口 IP 检测 (等价 psictl egress-test) - 优化版，减少 fork 压力
@@ -1999,6 +2044,11 @@ psiphon_set_region() {
     local cc="${1:-AUTO}"
     [[ -z "$cc" ]] && cc="AUTO"
     cc="${cc^^}"
+    if ! is_supported_psiphon_cc "$cc"; then
+        red "[!] Psiphon 不支持国家码: $cc"
+        show_supported_psiphon_codes
+        return 1
+    fi
     
     local name=$(get_country_name "$cc")
     yellow "[*] 切换 Psiphon 出口国家: $cc ($name)..."
@@ -2035,6 +2085,11 @@ psiphon_country_test() {
 
     for cc in "${list[@]}"; do
         cc="${cc^^}"
+        if ! is_supported_psiphon_cc "$cc" || [[ "$cc" == "AUTO" ]]; then
+            red "==> 跳过 $cc (Psiphon 不支持或不能用于国家检测)"
+            fail+=("$cc")
+            continue
+        fi
         local name=$(get_country_name "$cc")
         yellow "==> 测试 $cc ($name)"
         
@@ -2108,9 +2163,9 @@ PY
     printf '%s\n' "${ok[@]}" > "$WORKDIR/psiphon_ok_countries.txt" 2>/dev/null
 }
 
-# 测试所有常用国家
+# 测试所有支持国家
 psiphon_country_test_all() {
-    yellow "[*] 开始测试所有常用国家 (共 ${#PSI_ALL_CC[@]} 个)..."
+    yellow "[*] 开始测试所有支持国家 (共 ${#PSI_ALL_CC[@]} 个)..."
     yellow "[*] 这可能需要几分钟，请耐心等待..."
     echo
     psiphon_country_test "${PSI_ALL_CC[@]}"
@@ -2133,7 +2188,7 @@ psiphon_smart_country() {
             yellow "检测到上次测试结果 (${#ok_arr[@]} 个可用国家)"
             yellow "选项:"
             yellow "  1. 使用上次结果"
-            yellow "  2. 重新测试常用国家"
+            yellow "  2. 重新测试所有支持国家"
             yellow "  3. 快速测试 (仅 US/JP/SG/HK)"
             yellow "  0. 返回"
             reading "请选择: " test_choice
@@ -2154,7 +2209,7 @@ psiphon_smart_country() {
     else
         yellow "未检测到可用国家列表，需要先测试"
         yellow "选项:"
-        yellow "  1. 测试所有常用国家"
+        yellow "  1. 测试所有支持国家"
         yellow "  2. 快速测试 (仅 US/JP/SG/HK)"
         yellow "  0. 返回"
         reading "请选择: " test_choice
@@ -2214,7 +2269,7 @@ psiphon_management_menu() {
         clear
         echo
         green "============================================================"
-        green "  Psiphon 赛风管理 (psictl 等价功能)"
+        green "  Psiphon 出站管理"
         green "============================================================"
         echo
         
@@ -2235,38 +2290,38 @@ psiphon_management_menu() {
         psi_region="${psi_region:-AUTO}"
         local region_name=$(get_country_name "$psi_region")
         
+        purple "当前状态:"
         if [[ "$is_running" == "true" ]]; then
             if [[ "$psi_enabled" == "true" ]]; then
-                green "状态:     ✓ 运行中 (作为全局出站使用)"
+                green "  运行状态: ✓ 运行中 (已接入 sing-box)"
             else
-                yellow "状态:     ⚠ 运行中 (仅后台运行，未作为全局出站)"
+                yellow "  运行状态: ⚠ 运行中 (未接入 sing-box)"
             fi
-            blue "出口国家: $psi_region ($region_name)"
-            blue "SOCKS端口: 127.0.0.1:$psi_socks"
+            blue "  出口国家: $psi_region ($region_name)"
+            blue "  SOCKS端口: 127.0.0.1:$psi_socks"
         else
             if [[ "$psi_enabled" == "true" ]]; then
-                red "状态:     ⚠ 异常 (已配置出站，但后台进程未运行)"
+                red "  运行状态: ⚠ 异常 (已配置出站，但进程未运行)"
             else
-                yellow "状态:     ✗ 未启用"
+                yellow "  运行状态: ✗ 未启用"
             fi
         fi
         
         echo
         echo "------------------------------------------------------------"
-        green "  1. 查看当前出口 IP"
-        green "  2. 智能切换出口国家"
-        green "  3. 手动切换出口国家"
-        echo "  ------------"
+        green  "  1. 查看当前出口 IP"
+        green  "  2. 智能切换出口国家"
+        green  "  3. 手动切换出口国家"
+        echo "------------------------------------------------------------"
         yellow "  4. 快速测试国家 (US/JP/SG/HK)"
-        yellow "  5. 测试所有常用国家"
+        yellow "  5. 测试所有支持国家"
         yellow "  6. 自定义测试国家"
-        echo "  ------------"
-        blue "  7. 查看 Psiphon 日志"
-        blue "  8. 重启 Psiphon"
-        echo "  ------------"
+        echo "------------------------------------------------------------"
+        blue   "  7. 查看 Psiphon 日志"
+        blue   "  8. 重启 Psiphon"
         purple "  9. 多出口节点组管理"
-        echo "  ------------"
-        red "  0. 返回主菜单"
+        echo "------------------------------------------------------------"
+        red    "  0. 返回主菜单"
         echo "============================================================"
         reading "请选择 [0-9]: " choice
         echo
@@ -2280,10 +2335,7 @@ psiphon_management_menu() {
                 ;;
             3)
                 echo
-                green "常用国家码:"
-                yellow "  US=美国 JP=日本 SG=新加坡 "
-                yellow "  GB=英国 DE=德国 FR=法国 NL=荷兰"
-                yellow "  CA=加拿大 AU=澳大利亚 AUTO=自动"
+                show_supported_psiphon_codes
                 echo
                 reading "请输入国家码 (如 US): " new_cc
                 [[ -n "$new_cc" ]] && psiphon_set_region "$new_cc"
@@ -2297,7 +2349,7 @@ psiphon_management_menu() {
             6)
                 echo
                 yellow "请输入要测试的国家码 (空格分隔):"
-                yellow "例如: US JP SG HK TW KR"
+                yellow "例如: US JP SG HK DE FR"
                 reading "> " custom_list
                 if [[ -n "$custom_list" ]]; then
                     read -r -a cc_arr <<< "$custom_list"
@@ -2557,6 +2609,11 @@ add_psiphon_instance() {
         red "[!] 请指定国家码"
         return 1
     fi
+    if ! is_supported_psiphon_cc "$cc" || [[ "$cc" == "AUTO" ]]; then
+        red "[!] Psiphon 多出口不支持国家码: $cc"
+        show_supported_psiphon_codes
+        return 1
+    fi
     
     init_psiphon_instances_dir
     
@@ -2731,6 +2788,11 @@ add_egress_node_group() {
     
     if [[ -z "$cc" ]]; then
         red "[!] 请指定出口国家"
+        return 1
+    fi
+    if ! is_supported_psiphon_cc "$cc" || [[ "$cc" == "AUTO" ]]; then
+        red "[!] Psiphon 多出口不支持国家码: $cc"
+        show_supported_psiphon_codes
         return 1
     fi
     
@@ -3185,39 +3247,39 @@ multi_egress_menu() {
         clear
         echo
         green "============================================================"
-        green "  多出口节点组管理"
+        green "  Psiphon 多出口节点组管理"
         green "============================================================"
         echo
         
         # 显示现有节点组
         local groups=($(get_egress_node_groups))
+        purple "当前节点组:"
         if [[ ${#groups[@]} -gt 0 ]]; then
-            green "现有出口节点组:"
             for cc in "${groups[@]}"; do
                 local name=$(get_country_name "$cc")
                 local port=$(get_instance_socks_port "$cc")
                 local pid_file="$PSI_INSTANCES_DIR/$cc/psiphon.pid"
-                local status="✗"
+                local status="未运行"
                 if [[ -f "$pid_file" ]] && kill -0 $(cat "$pid_file") 2>/dev/null; then
-                    status="✓"
+                    status="运行中"
                 fi
-                printf "  %s %-4s %-10s (Psiphon: %s)\n" "$status" "$cc" "$name" "$port"
+                printf "  %-4s %-10s %-8s SOCKS: %s\n" "$cc" "$name" "$status" "$port"
             done
         else
-            yellow "  暂无多出口节点组"
+            yellow "  暂无节点组"
         fi
         
         echo
         echo "------------------------------------------------------------"
-        green "  1. ➕ 添加新出口节点组"
-        green "  2. ➖ 删除出口节点组"
-        green "  3. 📋 查看所有节点链接"
-        echo "  ------------"
-        yellow "  4. 🔄 重启所有 Psiphon 实例"
-        yellow "  5. ⏹️  停止所有 Psiphon 实例"
-        yellow "  6. 🔍 测试所有出口 IP"
-        echo "  ------------"
-        red "  0. 返回上级菜单"
+        green  "  1. 添加新出口节点组"
+        green  "  2. 删除出口节点组"
+        green  "  3. 查看所有节点链接"
+        echo "------------------------------------------------------------"
+        yellow "  4. 重启所有 Psiphon 实例"
+        yellow "  5. 停止所有 Psiphon 实例"
+        yellow "  6. 测试所有出口 IP"
+        echo "------------------------------------------------------------"
+        red    "  0. 返回上级菜单"
         echo "============================================================"
         reading "请选择 [0-6]: " choice
         echo
@@ -3225,9 +3287,7 @@ multi_egress_menu() {
         case "$choice" in
             1)
                 echo
-                green "常用国家码:"
-                yellow "  US=美国 JP=日本 SG=新加坡 HK=香港 TW=台湾"
-                yellow "  KR=韩国 GB=英国 DE=德国 FR=法国 NL=荷兰"
+                show_supported_psiphon_codes
                 echo
                 reading "请输入要添加的国家码 (如 JP): " new_cc
                 
@@ -5402,8 +5462,11 @@ view_logs_menu() {
 
 # 配置WARP出站 (安装后修改 - 保留现有节点)
 configure_warp_outbound() {
+    clear
     echo
-    green "==== 配置WARP出站 ===="
+    green "============================================================"
+    green "  WARP / Psiphon 出站配置"
+    green "============================================================"
     
     if [ ! -f "$WORKDIR/config.json" ]; then
         red "未检测到安装，请先安装节点"
@@ -5419,21 +5482,22 @@ configure_warp_outbound() {
     local current_port=$(cat "$WORKDIR/warp_best_port.txt" 2>/dev/null)
     
     echo
+    purple "当前状态:"
     if [[ "$current_status" == "true" ]]; then
         if [[ "$current_mode" == "all" ]]; then
-            blue "当前状态: WARP 已启用 (全部流量)"
+            blue "  WARP: 已启用 (全部流量)"
         else
-            blue "当前状态: WARP 已启用 (Google/YouTube分流)"
+            blue "  WARP: 已启用 (Google/YouTube 分流)"
         fi
         
         # 显示当前 Endpoint
         if [ -n "$current_endpoint" ]; then
-            green "当前 Endpoint: ${current_endpoint}:${current_port:-2408}"
+            green "  Endpoint: ${current_endpoint}:${current_port:-2408}"
         else
-            yellow "当前 Endpoint: 默认 (未优选)"
+            yellow "  Endpoint: 默认 (未优选)"
         fi
     else
-        yellow "当前状态: WARP 未启用 (直连)"
+        yellow "  WARP: 未启用 (直连)"
     fi
     
     # 显示 Psiphon 状态
@@ -5441,28 +5505,30 @@ configure_warp_outbound() {
     local psi_mode=$(cat "$WORKDIR/psiphon_mode.txt" 2>/dev/null)
     if [[ "$psi_status" == "true" ]]; then
         if [[ "$psi_mode" == "all" ]]; then
-            purple "Psiphon: ✓ 已启用 (全部流量)"
+            purple "  Psiphon: 已启用 (全部流量)"
         else
-            purple "Psiphon: ✓ 已启用 (分流模式)"
+            purple "  Psiphon: 已启用 (分流模式)"
         fi
+    else
+        purple "  Psiphon: 未启用"
     fi
     
     echo
-    yellow "===== WARP 出站 ====="
+    echo "------------------------------------------------------------"
     yellow "  0. 不使用 WARP (直连)"
     yellow "  1. 全部流量走 WARP"
     yellow "  2. 仅 Google/YouTube 走 WARP (分流)"
-    echo "  -------------"
+    echo "------------------------------------------------------------"
     green "  3. 优选 Endpoint IP (优化连接质量)"
     blue "  4. 恢复 Cloudflare 默认 Endpoint"
     blue "  5. 重新获取勇哥API配置"
-    echo
-    purple "===== Psiphon 出站 ====="
+    echo "------------------------------------------------------------"
     purple "  6. Psiphon 全局出站"
     purple "  7. Psiphon 分流出站 (Google/OpenAI/Netflix)"
     purple "  8. 关闭 Psiphon"
-    echo "  -------------"
+    echo "------------------------------------------------------------"
     yellow "  9. 返回主菜单"
+    echo "============================================================"
     reading "请选择 [0-9]: " new_choice
     
     if [[ "$new_choice" == "9" ]]; then
@@ -5995,29 +6061,29 @@ menu() {
     
     echo
     echo "------------------------------------------------------------"
-    green "  1. 一键安装多协议节点"
+    green  "  1. 一键安装多协议节点"
     echo "------------------------------------------------------------"
     yellow "  2. 卸载删除"
     echo "------------------------------------------------------------"
-    green "  3. 重启所有进程"
+    green  "  3. 重启所有进程"
     echo "------------------------------------------------------------"
-    green "  4. 重置Argo隧道"
+    green  "  4. 重置Argo隧道"
     echo "------------------------------------------------------------"
-    green "  5. 查看节点信息"
+    green  "  5. 查看节点信息"
     echo "------------------------------------------------------------"
-    blue "  6. 自定义节点组合推送"
+    blue   "  6. 自定义节点组合推送"
     echo "------------------------------------------------------------"
     yellow "  7. 重置端口"
     echo "------------------------------------------------------------"
-    blue "  8. 查看运行日志"
+    blue   "  8. 查看运行日志"
     echo "------------------------------------------------------------"
-    blue "  9. 配置WARP/Psiphon出站"
+    blue   "  9. 配置 WARP / Psiphon 出站"
     echo "------------------------------------------------------------"
-    purple " 11. Psiphon 管理 (国家切换/出口检测)"
+    purple " 10. Psiphon 出站管理"
     echo "------------------------------------------------------------"
-    red " 10. 系统初始化清理"
+    red    " 11. 系统初始化清理"
     echo "------------------------------------------------------------"
-    red "  0. 退出"
+    red    "  0. 退出"
     echo "============================================================"
     
     reading "请选择 [0-11]: " choice
@@ -6033,7 +6099,8 @@ menu() {
         7) reset_all_ports ;;
         8) view_logs_menu ;;
         9) configure_warp_outbound ;;
-        10) 
+        10) psiphon_management_menu ;;
+        11)
             reading "确定清理所有内容? (y/N): " confirm
             if [[ "$confirm" =~ ^[Yy]$ ]]; then
                 # 停止所有服务
@@ -6049,7 +6116,6 @@ menu() {
                 green "系统已重置"
             fi
             ;;
-        11) psiphon_management_menu ;;
         0) exit 0 ;;
         *) red "无效选项" ;;
     esac
